@@ -1,0 +1,47 @@
+{
+  "name": "ab_device_poses_replay_2k",
+  "output": "experiments/results/ab_device_poses_replay_2k",
+  "captures": [
+    "demo/input/drone_demo.mp4"
+  ],
+  "flags": [
+    "--max_steps",
+    "2000",
+    "--trainer-arg",
+    "stream_ace_mode=continuous",
+    "--seed",
+    "42",
+    "--with_ut",
+    "--difix-online",
+    "--trainer-arg",
+    "difix_cycle_start_frac=0.5",
+    "--trainer-arg",
+    "difix_pseudo_share=0.15",
+    "--trainer-arg",
+    "stream_replay=/mnt/Shared/3D_WORLD_GENRATION/3D_world_genrator/experiments/recordings/drone_continuous_2k.arrows"
+  ],
+  "repeats": {
+    "baseline": 3,
+    "device_a1": 2,
+    "filter_a03": 1,
+    "tiers_a1": 3,
+    "default": 1
+  },
+  "variants": {
+    "baseline": {},
+    "device_a1": {
+      "stream_device_poses": true
+    },
+    "filter_a03": {
+      "stream_device_poses": true,
+      "stream_pose_alpha": 0.3
+    },
+    "tiers_a1": {
+      "stream_device_poses": true,
+      "stream_tiers": true
+    }
+  },
+  "map_cache": true,
+  "keep_checkpoints": false,
+  "notes": "CUDA plan item 5 on a fixed ACE stream (replay of experiments/recordings/drone_continuous_2k.arrows, recorded run 21.12 dB): baseline = replay only (noise floor with ACE pinned); device_a1 = device pose table, no filter (parity); filter_a03 = SO(3)xR3 EMA gain 0.3 on relocalization jitter; +tiers = stability-weighted sampling. Re-scoped after filter_a03 r0 (-1.0 dB): relocalization moves are mostly drift, not jitter (innovation vs filtered pose 8.7% median vs 2.5% unfiltered), so the EMA lags the map and misaligns train vs held-out cameras. Filter arms dropped; tiers tested alone (alpha 1)."
+}

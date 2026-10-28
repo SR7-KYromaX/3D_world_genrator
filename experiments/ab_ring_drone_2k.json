@@ -1,0 +1,16 @@
+{
+  "name": "ab_ring_drone_2k",
+  "output": "experiments/results/ab_ring_drone_2k",
+  "captures": ["demo/input/drone_demo.mp4"],
+  "flags": ["--max_steps", "2000", "--trainer-arg", "stream_ace_mode=continuous", "--seed", "42",
+            "--with_ut", "--difix-online", "--trainer-arg", "difix_cycle_start_frac=0.5",
+            "--trainer-arg", "difix_pseudo_share=0.15"],
+  "repeats": {"baseline": 3, "ring": 3, "default": 1},
+  "variants": {
+    "baseline": {},
+    "ring": {"stream_ring": true}
+  },
+  "map_cache": true,
+  "keep_checkpoints": false,
+  "notes": "CUDA-level plan step 2: ACE pose/reloc rows through shared-memory rings (hypersplat/stream/ring.py) vs the Arrow pipe, in the stream demo's configuration (continuous ACE, 3DGUT, online Difix with pinned-weight residency in both arms). Transport only: the arms should match within run-to-run noise; n=3 each also measures continuous mode's own spread."
+}

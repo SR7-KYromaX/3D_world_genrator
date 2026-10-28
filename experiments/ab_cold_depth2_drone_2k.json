@@ -1,0 +1,39 @@
+{
+  "name": "ab_cold_depth2_drone_2k",
+  "output": "experiments/results/ab_cold_depth2_drone_2k",
+  "captures": [
+    "demo/input/drone_demo.mp4"
+  ],
+  "flags": [
+    "--stream-depth",
+    "--no-early-stopping",
+    "--max_steps",
+    "2000",
+    "--trainer-arg",
+    "stream_cycle_refit_min=1000000",
+    "--with_ut"
+  ],
+  "repeats": {
+    "baseline": 2,
+    "depth50": 2,
+    "depth10": 2
+  },
+  "variants": {
+    "baseline": {
+      "stream_cold_start": true
+    },
+    "depth50": {
+      "stream_cold_start": true,
+      "stream_mapper_depth": true,
+      "stream_mapper_depth_weight": 50.0
+    },
+    "depth10": {
+      "stream_cold_start": true,
+      "stream_mapper_depth": true,
+      "stream_mapper_depth_weight": 10.0
+    }
+  },
+  "map_cache": false,
+  "keep_checkpoints": false,
+  "notes": "Soft depth prior in the ACE mapper (reprojection loss stays the main loss) at weights 50 / 10 vs plain cold start; n=2 because cold start spreads ~1.3 dB."
+}
