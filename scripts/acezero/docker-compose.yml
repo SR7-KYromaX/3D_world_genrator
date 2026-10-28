@@ -1,0 +1,25 @@
+services:
+  acezero:
+    restart: always
+    container_name: acezero
+    build:
+      context: .
+      dockerfile: Dockerfile
+    tty: true
+    stdin_open: true
+    ports:
+      - "7007:7007"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: 'nvidia'
+              count: all
+              capabilities: [ gpu ]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Mount the whole project root to /workspace for zero-copy data flow
+      - ../../:/workspace
+      # Mount user's Downloads folder for input videos (override via ACEZERO_DOWNLOADS_DIR)
+      - ${ACEZERO_DOWNLOADS_DIR:-./downloads}:/workspace/downloads:ro

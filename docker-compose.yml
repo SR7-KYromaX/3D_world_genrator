@@ -1,0 +1,41 @@
+services:
+  gsplat-server:
+    build: .
+    image: gsplat-pipeline:latest
+    container_name: gsplat-server
+    restart: unless-stopped
+    ports:
+      # NOTE: `command:` below overrides the Dockerfile's own uvicorn CMD to
+      # run demo/demo_server.py, which binds HYPERSPLAT_SERVER_PORT (8081)
+      # instead of 8080. This mapping is kept for compatibility with anything
+      # that still expects 8080 (e.g. running without the command override),
+      # but nothing listens on 8080 in the current compose setup.
+      - "8080:8080"
+      - "8081:8081"
+      # Expose visualization port (if needed)
+      - "8092:8092"
+    volumes:
+      # Persist output data
+      - ./demo/output:/app/demo/output
+      # Mount inputs if needed (optional)
+      # - ./inputs:/app/inputs
+      # Cache huggingface models
+      - hf_cache:/root/.cache/huggingface
+      - torch_cache:/root/.cache/torch
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - MAX_JOBS=4 # Limit build parallelism to avoid OOM
+      - HYPERSPLAT_SERVER_PORT=8081
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [ gpu ]
+    command: python demo/demo_server.py
+
+volumes:
+  hf_cache:
+  torch_cache:
