@@ -30,6 +30,11 @@ if __name__ == '__main__':
     parser.add_argument('--base_seed', type=int, default=2089,
                         help='seed to control randomness')
 
+    parser.add_argument('--deterministic', type=_strtobool, default=False,
+                        help='fixed cuDNN algorithms and deterministic kernels: the cuDNN autotuner '
+                             'picks algorithms by timing, so a run sharing the GPU trained a different '
+                             'map (the inlier-triggered cooldown amplifies the tiny numeric change)')
+
     # === Data definition ==============================================================================================
 
     parser.add_argument('--pose_files', type=str, default=None,
@@ -67,7 +72,7 @@ if __name__ == '__main__':
                         help='Learning rate for refining calibration parameters.')
 
     parser.add_argument('--use_heuristic_focal_length', type=_strtobool, default=False,
-                        help="Focal length set to 70% of image diagonal. Recommended to activate refine_calibration."
+                        help="Focal length set to 70%% of image diagonal. Recommended to activate refine_calibration."
                              "If False, use_external_focal_length or use_ace_pose_file must be set.")
 
     parser.add_argument('--use_external_focal_length', type=float, default=None,
@@ -213,7 +218,7 @@ if __name__ == '__main__':
                         help='Linear increase of diffusion weight in first N iterations. ACE -> 1000, ACE0 -> -1 (disabled)')
 
     parser.add_argument('--prior_diffusion_subsample', type=float, default=1.0,
-                        help='Sub-sample ratio for inputs to diffusion prior for large batch sizes. 1.0 = no subsampling, 0.1 = use 10% of samples')
+                        help='Sub-sample ratio for inputs to diffusion prior for large batch sizes. 1.0 = no subsampling, 0.1 = use 10%% of samples')
 
     # === Data augmentation ============================================================================================
 
@@ -270,6 +275,10 @@ if __name__ == '__main__':
 
     parser.add_argument('--pose_refinement_lr', type=float, default=0.001,
                         help='learning rate for the pose refinement')
+
+    parser.add_argument('--pose_refinement_zero_init', type=_strtobool, default=False,
+                        help='zero-init the refiner output layer so refinement starts at the input poses '
+                             '(no random offset at iteration 0; for warm-started refits)')
 
     parser.add_argument('--refinement_ortho', type=str, default="gram-schmidt", choices=['gram-schmidt', 'procrustes'],
                         help='orthogonalization method for pose rotations after pose updates')

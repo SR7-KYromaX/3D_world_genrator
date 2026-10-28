@@ -6,6 +6,7 @@ Condensed & Optimized Version
 Flow: Video -> ACE-Zero (AI Poses) -> 3DGS Training (MCMC)
 """
 
+import os
 import sys
 import subprocess
 import time
@@ -15,14 +16,37 @@ import json
 from pathlib import Path
 from typing import Dict, Optional
 import shutil
+
+# Keep HF model downloads (Difix, ~5 GB) on the data drive, not ~/.cache on the root disk.
+# Must be set before diffusers/huggingface_hub are imported.
+_SHARED_HF_CACHE = Path(__file__).resolve().parents[3] / "hf_cache"
+if _SHARED_HF_CACHE.is_dir():
+    os.environ.setdefault("HF_HOME", str(_SHARED_HF_CACHE))
+
 import numpy as np
 import cv2
 import torch
+import yaml
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Starting training budget of a live stream without --steps; it grows as views arrive
+LIVE_INITIAL_STEPS = 2000
+
+
+
+def find_newest_ckpt(ckpt_dir: Path, pattern: str = "ckpt_*_rank0.pt") -> Optional[Path]:
+    """Newest checkpoint by write time, then step.
+
+    Picking by step alone is wrong when a result dir is reused: a stale ckpt_6999 from a
+    longer earlier run would outrank this run's ckpt_4199.
+    """
+    ckpts = list(ckpt_dir.glob(pattern))
+    if not ckpts:
+        return None
+    return max(ckpts, key=lambda p: (p.stat().st_mtime, int(p.stem.split("_")[1])))
 
 
 def resolve_path_relative_to_project(path_str: str, must_exist: bool = False, must_be_file: bool = False) -> Path:
@@ -81,6 +105,7 @@ class PipelineConfig:
         
         # Quality/Tuning
         self.INIT_SCALE = args.init_scale
+        self.CAP_MAX = getattr(args, 'cap_max', None)  # MCMC Gaussian cap (None = trainer default 1M)
         self.OPACITY_REG = args.opacity_reg
         self.SCALE_REG = args.scale_reg
         self.USE_APP_OPT = args.app_opt
@@ -135,26 +160,83 @@ class PipelineConfig:
         self.GENVS_NUM_VIEWS = getattr(args, 'genvs_views', 20)  # Number of novel views
         self.GENVS_CKPT = getattr(args, 'genvs_ckpt', None)
 
+        # Generative backend for the GeNVS slots:
+        #   "difix" - pretrained nvidia/difix_ref (Difix3D+) repairs 3DGS renders at pseudo
+        #             poses (non-commercial license). Needs a trained 3DGS, so it only runs
+        #             in the feedback loop, not in the pre-training step 1.5 slot.
+        #   "core"  - the in-repo GeNVS diffusion model; requires a trained --genvs_ckpt.
+        self.GENVS_BACKEND = getattr(args, 'genvs_backend', 'difix')
+        self.DIFIX_NUM_VIEWS = getattr(args, 'difix_views', 24)
+        self.DIFIX_MAX_ANGLE = getattr(args, 'difix_max_angle', 20.0)
+        self.DIFIX_PSEUDO_WEIGHT = getattr(args, 'difix_pseudo_weight', 0.5)
+
         # JOGS-style Joint Pose-3DGS Optimization (default ON)
         self.POSE_OPT = getattr(args, 'pose_opt', True)
         self.POSE_OPT_WARMUP = getattr(args, 'pose_opt_warmup', 1000)  # Steps before pose opt starts
 
-        # [Autoregressive GeNVS] The "Dream" Loop
+        # [Autoregressive GeNVS] The "Dream" Loop (3DGS <-> generative feedback loop)
         self.GENVS_AUTOREGRESSIVE = getattr(args, 'genvs_autoregressive', False)
-
-        # [ROBUSTNESS] Flag Validation
-        if self.WITH_UT and self.POSE_OPT:
-            logger.warning("Unscented Transform (+UT) + Pose Opt is currently incompatible in gsplat.")
-            logger.warning("Disabling UT/Eval3D to prioritize Pose Optimization.")
-            self.WITH_UT = False
-            self.WITH_EVAL3D = False
-
+        self.REFINE_LOOPS = getattr(args, 'refine_loops', 3)
+        if getattr(args, 'difix', False):
+            # --difix is shorthand for the feedback loop with the Difix backend
+            self.GENVS_AUTOREGRESSIVE = True
+            self.GENVS_BACKEND = 'difix'
 
         # Streaming mode: dynamically accept new poses during training
         # Removed redundant STREAMING reset that ignored unified_stream
 
         # How often to check for new poses (in training steps)
         self.STREAMING_INTERVAL = getattr(args, 'streaming_check_interval', 1000)
+
+        # Streaming pipeline (hypersplat/stream): the input is a source spec - video file,
+        # camera index, /dev/videoN, rtsp/http URL or flight://host:port - and frames flow
+        # through an in-memory keyframe store + ACE sidecar straight into training.
+        self.STREAM = getattr(args, 'stream', False)
+        self.STREAM_PACE = getattr(args, 'stream_pace', 'auto')
+        self.STREAM_BUDGET_MB = getattr(args, 'stream_budget_mb', 384.0)
+        self.STREAM_FLIGHT_PORT = getattr(args, 'stream_flight_port', None)
+        self.STREAM_VIEWER_PORT = getattr(args, 'stream_viewer_port', None)       # viser 3DGS viewer
+        self.STREAM_DASHBOARD_PORT = getattr(args, 'stream_dashboard_port', None) # viewer | camera page
+        self.STREAM_DASHBOARD_HOST = getattr(args, 'stream_dashboard_host', '127.0.0.1')
+        # Stop recording a live source after this long / this many keyframes (None: until the
+        # dashboard button or <result_dir>/STOP_RECORDING); training continues afterwards
+        self.STREAM_RECORD_SECONDS = getattr(args, 'stream_record_seconds', None)
+        self.STREAM_RECORD_KEYFRAMES = getattr(args, 'stream_record_keyframes', None)
+        # Stream early stop (with early stopping on): held-out PSNR counted as "good enough"
+        self.STREAM_TARGET_PSNR = getattr(args, 'stream_target_psnr', None)
+        # Dense depth for streams: Depth Anything V2 aligned to ACE points (seeding + loss)
+        self.STREAM_DEPTH = getattr(args, 'stream_depth', False)
+        # Per-keyframe pose deltas / exposure for streams (the generic pose_opt is per-image)
+        self.STREAM_POSE_OPT = getattr(args, 'stream_pose_opt', False)
+        self.STREAM_BOOTSTRAP_COOLDOWN = getattr(args, 'stream_bootstrap_cooldown', None)
+        self.STREAM_MAP_CACHE = getattr(args, 'stream_map_cache', None)
+        # Raw trainer overrides (KEY=VALUE -> --KEY VALUE), appended last so they win
+        # (scripts/experiments/ab_test.py uses these to vary trainer hyperparameters)
+        self.TRAINER_ARGS = list(getattr(args, 'trainer_arg', None) or [])
+        self.STREAM_EXPOSURE_OPT = getattr(args, 'stream_exposure_opt', False)
+        # Online Difix: refine inside training instead of the STEP 3 retrain loop
+        self.DIFIX_ONLINE = getattr(args, 'difix_online', False)
+        # Reproducible runs: trainer seed, deterministic kernels / inline view sampling, and
+        # deterministic ACE map training (bootstrap, refits) for stream runs
+        self.SEED = getattr(args, 'seed', None)
+        self.DETERMINISTIC = getattr(args, 'deterministic', False)
+
+        # [ROBUSTNESS] Flag Validation. gsplat's UT projection is not differentiable, so UT
+        # trains only with the world-space (eval3d) rasterizer, and neither passes gradients
+        # to camera poses.
+        if self.WITH_UT:
+            self.WITH_EVAL3D = True
+            if self.STREAM:
+                # Streams drop per-image pose_opt anyway (changing image set): UT wins
+                self.POSE_OPT = False
+                if self.STREAM_POSE_OPT:
+                    logger.warning("UT has no pose gradients: disabling per-keyframe pose deltas.")
+                    self.STREAM_POSE_OPT = False
+            elif self.POSE_OPT:
+                logger.warning("Unscented Transform (+UT) + Pose Opt is currently incompatible in gsplat.")
+                logger.warning("Disabling UT/Eval3D to prioritize Pose Optimization.")
+                self.WITH_UT = False
+                self.WITH_EVAL3D = False
 
         # GeNVS Online Integration
         self.GENVS_INTERVAL = getattr(args, 'genvs_interval', 1000)
@@ -208,6 +290,41 @@ class PipelineConfig:
         # blindly overwriting it. See `_patch_config` below.
         self.TRAINING_STEPS_ADD = getattr(args, 'training_steps_add', 0)
 
+        # Held-out split used by the trainer and the Difix augmenter (must match)
+        self.TEST_EVERY = getattr(args, 'test_every', None) or 8
+
+        self._resolve_auto_params(args)
+
+    # [Dynamic Parameters] config attribute -> (argparse dest, previous hard-coded default).
+    # A None arg means "auto": the fallback applies until a strategy in
+    # hypersplat/pipeline/params/strategies derives a value from measured signals.
+    # Explicitly passed values are recorded in USER_SET and never overridden.
+    AUTO_PARAMS = {
+        "FPS": ("fps", 10.0),
+        "DATA_FACTOR": ("data_factor", 2),
+        "TRAINING_MAX_STEPS": ("max_steps", 7000),
+        "TRAINING_EVAL_STEPS": ("eval_steps", [3000, 7000]),
+        "TRAINING_SAVE_STEPS": ("save_steps", [3000, 7000]),
+        "INIT_SCALE": ("init_scale", 2.5),
+        "CAP_MAX": ("cap_max", None),
+        "MIN_REGISTRATION_CONFIDENCE": ("min_registration_confidence", 1000),
+        "POSE_OPT_WARMUP": ("pose_opt_warmup", 1000),
+        "REFINE_LOOPS": ("refine_loops", 3),
+        "DIFIX_NUM_VIEWS": ("difix_views", 24),
+        "DIFIX_MAX_ANGLE": ("difix_max_angle", 20.0),
+        "DIFIX_PSEUDO_WEIGHT": ("difix_pseudo_weight", 0.5),
+    }
+
+    def _resolve_auto_params(self, args):
+        self.USER_SET = set()
+        for attr, (dest, fallback) in self.AUTO_PARAMS.items():
+            value = getattr(args, dest, None)
+            if value is None:
+                setattr(self, attr, fallback)
+            else:
+                setattr(self, attr, value)
+                self.USER_SET.add(attr)
+
     def create_directories(self):
         """Ensure output directories exist"""
         dirs = [self.OUTPUT_BASE, self.OUTPUT_BASE / "results"]
@@ -222,7 +339,9 @@ class IntelligentPipeline:
 
     def run(self, video_path: str) -> Dict:
         """Execute the optimized ACE-Zero -> 3DGS pipeline"""
-        
+        if self.config.STREAM:
+            return self.run_stream(video_path)
+
         # Resolve video path using helper function (must exist and be a file)
         video_path = resolve_path_relative_to_project(video_path, must_exist=True, must_be_file=True)
         
@@ -235,6 +354,19 @@ class IntelligentPipeline:
         logger.info(f"Output: {self.config.OUTPUT_BASE}")
 
         self.config.create_directories()
+
+        # Measured signals shared by all stages; strategies derive parameters from them
+        from hypersplat.pipeline.params import PROFILE_ENV, PROFILE_FILENAME, SceneProfile
+        self.profile = SceneProfile.load(self.config.OUTPUT_BASE / PROFILE_FILENAME)
+        # A rerun into the same output dir keeps measured scene signals (video/ace/points)
+        # but must not decide from the previous run's results or decisions
+        self.profile.discard("train", "difix", "decisions")
+        os.environ[PROFILE_ENV] = str(self.profile.path)  # for stage subprocesses
+        from hypersplat.pipeline.params import Decision, record
+        for name in sorted(self.config.USER_SET):
+            record(name, Decision(getattr(self.config, name), "user", "set explicitly"), self.profile)
+        self._record_video_signals(video_path)
+        self._apply_param_stage("pre_ace")
 
         try:
             # 1. Pose Estimation (or Load Existing)
@@ -303,15 +435,31 @@ class IntelligentPipeline:
                 else:
                     ace_output = self._run_pose_estimation(video_path)
             
+            self._record_ace_signals(ace_output)
+            self._apply_param_stage("post_ace")
+
+            # Real-image dataset; feedback-loop pseudo views are always regenerated from it
+            self._base_colmap_dir = ace_output
+
             # 1.5. GeNVS Novel View Generation (optional)
             if self.config.GENVS_ENABLED:
-                ace_output = self._run_novel_view_generation(ace_output)
+                if self.config.GENVS_BACKEND == 'difix':
+                    logger.info("Step 1.5 skipped: the Difix backend needs a trained 3DGS to render "
+                                "from, so it runs in the feedback loop instead (enabling it).")
+                    self.config.GENVS_AUTOREGRESSIVE = True
+                else:
+                    ace_output = self._run_novel_view_generation(ace_output)
             
             # 2. Training
+            self._record_gpu_signals()
+            self._apply_param_stage("pre_train")
             result_dir = self._run_training(ace_output)
             
-            # 2.2 Autoregressive Refinement (The "Dream" Loop)
-            if self.config.GENVS_AUTOREGRESSIVE:
+            # 2.2 Autoregressive Refinement (The "Dream" Loop). Online Difix already
+            # refined inside training, so the render -> Difix -> retrain loop is skipped.
+            if self.config.GENVS_AUTOREGRESSIVE and self.config.DIFIX_ONLINE:
+                logger.info("STEP 3 skipped: online Difix refined during training")
+            elif self.config.GENVS_AUTOREGRESSIVE:
                 result_dir = self._run_autoregressive_refinement(ace_output, result_dir)
             
             # 2.5. Floater Pruning (optional post-processing)
@@ -336,6 +484,79 @@ class IntelligentPipeline:
         except Exception as e:
             logger.error(f"Pipeline Failed: {e}")
             raise
+
+    # ------------------------------------------------------------------
+    # Dynamic parameters: record measured signals, then run strategies
+    # ------------------------------------------------------------------
+    def _apply_param_stage(self, stage: str):
+        from hypersplat.pipeline.params.strategies import apply_stage
+        apply_stage(stage, self.profile, self.config)
+
+    def _record_video_signals(self, video_path: Path):
+        from hypersplat.pipeline.params import signals
+        info = signals.probe_video(video_path)
+        if info:
+            for k, v in info.items():
+                self.profile.set(f"video.{k}", v, "probe_video")
+        self._record_gpu_signals()
+
+    def _record_gpu_signals(self):
+        from hypersplat.pipeline.params import signals
+        mem = signals.gpu_memory()
+        if mem:
+            self.profile.set("gpu.free_mb", round(mem[0]), "gpu_memory")
+            self.profile.set("gpu.total_mb", round(mem[1]), "gpu_memory")
+        self.profile.save()
+
+    def _record_ace_signals(self, ace_output: Path):
+        from hypersplat.pipeline.params import signals
+        ace = signals.read_ace_poses(ace_output)
+        if ace:
+            self.profile.set("ace.focal_median", ace["focal_median"], ace["path"])
+            self.profile.set("ace.conf", ace["conf"], ace["path"])
+            self.profile.set("ace.n_registered", len(ace["conf"]), ace["path"])
+        frames = signals.image_folder_stats(ace_output / "images")
+        if frames:
+            for k, v in zip(("count", "width", "height"), frames):
+                self.profile.set(f"frames.{k}", v, "images/")
+        n_points = signals.count_points3d(ace_output / "sparse" / "0" / "points3D.bin")
+        if n_points is not None:
+            self.profile.set("points.count", n_points, "points3D.bin")
+
+        # Intrinsics: perception.py recorded this run's focal decisions on disk; they replace
+        # any left in memory from an earlier run into the same output folder
+        from hypersplat.pipeline.params import SceneProfile, record
+        from hypersplat.pipeline.params.strategies import intrinsics
+        on_disk = SceneProfile.load(self.profile.path)
+        for key in ("decisions.FOCAL_INIT_PX", "decisions.FOCAL_PX"):
+            if on_disk.get(key) is not None:
+                self.profile.set(key, on_disk.get(key))
+        # Repair a reused cameras.bin (--colmap-input / skip-ACE) whose focal disagrees with
+        # ACE-Zero's refined one. Not in streaming mode: ACE and the pose watcher are still
+        # writing sparse/0 then.
+        if ace and not self.config.STREAMING:
+            try:
+                fixed = intrinsics.fix_stale_cameras(ace_output / "sparse" / "0" / "cameras.bin",
+                                                     ace["focal_median"], self.profile.get("frames.width"))
+            except Exception as e:  # a malformed cameras.bin must not stop the run
+                logger.warning(f"[param] could not check cameras.bin focal: {e}")
+                fixed = None
+            if fixed is not None:
+                record("FOCAL_PX", fixed, self.profile)
+        self.profile.save()
+
+    def _record_training_signals(self, result_dir: Path):
+        from hypersplat.pipeline.params import signals
+        rows = signals.read_val_stats(result_dir)
+        if rows:
+            val = self.profile.get("train.val") or []
+            seen = {(r.get("result_dir"), r.get("step")) for r in val}
+            for r in rows:
+                r["result_dir"] = str(result_dir)
+                if (r["result_dir"], r["step"]) not in seen:
+                    val.append(r)
+            self.profile.set("train.val", val, "val_step*.json")
+        self.profile.save()
 
     def _detect_existing_ace_output(self) -> bool:
         """Check if valid ACE-Zero output already exists (consistent with pipeline_wrapper.py)."""
@@ -542,9 +763,37 @@ class IntelligentPipeline:
                     use_core_genvs = False
 
             if not use_core_genvs:
-                # Initialize GeNVS-Lite (uses ZoeDepth by default)
-                genvs = GeNVSLite(use_zoedepth=True)
-                
+                # NOTE: despite its name and the `use_zoedepth` flag, GeNVSLite does not
+                # implement any depth-based warping fallback - it runs the same untrained
+                # GeNVSPipeline diffusion model as the "Core" path above. Without a real
+                # trained checkpoint, sampling from randomly-initialized weights produces
+                # pure noise, which would silently corrupt the training set if injected.
+                # Guard against that explicitly, mirroring the Core path's own checkpoint
+                # check above, instead of generating garbage views.
+                ckpt_path = None
+                if self.config.GENVS_CKPT and Path(self.config.GENVS_CKPT).exists():
+                    ckpt_path = self.config.GENVS_CKPT
+                else:
+                    ckpt_dir = Path("results/genvs_train/checkpoints")
+                    if ckpt_dir.exists():
+                        ckpts = sorted(ckpt_dir.glob("step_*.pt"),
+                                      key=lambda p: int(p.stem.split("_")[1]))
+                        if ckpts:
+                            ckpt_path = str(ckpts[-1])
+
+                if not ckpt_path:
+                    logger.warning(
+                        "  [GeNVS-Lite] No trained GeNVS checkpoint found (checked "
+                        "--genvs_ckpt and results/genvs_train/checkpoints/). GeNVS-Lite has "
+                        "no depth-based fallback implemented - it would sample from an "
+                        "untrained diffusion model, producing noise. Skipping novel-view "
+                        "augmentation rather than injecting garbage views. Train a checkpoint "
+                        "first via hypersplat/beta/genvs/train.py, or pass --genvs_ckpt <path>."
+                    )
+                    return colmap_dir
+
+                genvs = GeNVSLite(checkpoint_path=ckpt_path, use_zoedepth=True)
+
                 image_files = sorted(input_images_dir.glob("*.jpg")) + sorted(input_images_dir.glob("*.png"))
                 if not image_files:
                     logger.warning("  No images found, skipping GeNVS")
@@ -596,11 +845,74 @@ class IntelligentPipeline:
             del novel_views
             self._clear_gpu_memory()
 
-    def _run_training(self, data_dir: Path, resume_ckpt: Optional[Path] = None) -> Path:
+    def _perform_difix_refinement(self, data_dir: Path, result_dir: Path, iter_dir: Path,
+                                  overrides: Dict, loop_idx: int) -> Path:
+        """Difix backend for the feedback-loop GeNVS slot.
+
+        Renders pseudo views from the current 3DGS, repairs them with nvidia/difix_ref
+        (conditioned on the nearest real frame) and returns an augmented dataset of the real
+        images plus the pseudo views, weighted by ACE-Zero pose confidence. The orbit angle
+        is closed-loop (params/strategies/difix.py): it widens while Difix stays faithful
+        (high render->fixed change PSNR, recorded per round in difix.rounds) and shrinks
+        when Difix starts rewriting the renders.
+
+        Governor overrides: `genvs_sample_mode: random` draws new pseudo-camera placements
+        each loop; `deterministic` keeps them fixed. Guidance/scheduler/noise-level are
+        multi-step sampler knobs with no meaning for single-step Difix and are ignored.
+        """
+        from argparse import Namespace
+        from hypersplat.beta.difix.augment import run as difix_augment
+
+        ckpt = find_newest_ckpt(result_dir / "ckpts")
+        if ckpt is None:
+            logger.warning(f"  [Difix] No checkpoint in {result_dir}/ckpts; skipping this loop")
+            return data_dir
+
+        ignored = [k for k in ("genvs_guidance", "genvs_scheduler", "genvs_noise_level") if k in overrides]
+        if ignored:
+            logger.info(f"  [Difix] Ignoring multi-step sampler overrides {ignored} (single-step model)")
+        seed = loop_idx + 1 if overrides.get("genvs_sample_mode") == "random" else 0
+
+        base_dir = getattr(self, "_base_colmap_dir", data_dir)
+        user_set = getattr(self.config, "USER_SET", set())
+        if "DIFIX_MAX_ANGLE" in user_set:
+            # Explicit --difix-max-angle: keep the fixed progressive schedule up to that cap
+            max_angle = self.config.DIFIX_MAX_ANGLE * (loop_idx + 1) / max(self.config.REFINE_LOOPS, 1)
+        else:
+            # Closed loop: the DIFIX_MAX_ANGLE strategy already chose this loop's angle
+            max_angle = self.config.DIFIX_MAX_ANGLE
+        # Explicit --min-registration-confidence anchors the confidence ramp; otherwise augment
+        # derives it from the confidence distribution
+        min_conf = (float(self.config.MIN_REGISTRATION_CONFIDENCE)
+                    if "MIN_REGISTRATION_CONFIDENCE" in user_set else None)
+        out_dir = iter_dir / "augmented_colmap"
+        logger.info(f"  [Difix] Loop {loop_idx + 1}: {self.config.DIFIX_NUM_VIEWS} pseudo views up to "
+                    f"{max_angle:.1f} deg from {ckpt.name} (seed {seed})")
+        profile = getattr(self, "profile", None)
+        if profile is not None:
+            profile.save()  # augment appends difix.rounds to the same file
+        difix_augment(Namespace(
+            data_dir=str(base_dir), ckpt=str(ckpt), out_dir=str(out_dir),
+            num_views=self.config.DIFIX_NUM_VIEWS, max_angle=max_angle,
+            pseudo_weight=self.config.DIFIX_PSEUDO_WEIGHT,
+            min_conf=min_conf, weight_floor=None,
+            test_every=self.config.TEST_EVERY, model_id="nvidia/difix_ref", no_difix=False, pose_rel_scale=0.1,
+            ckpt_data_dir=str(data_dir), seed=seed, loop=loop_idx,
+            profile=str(profile.path) if profile is not None and profile.path else None,
+        ))
+        if profile is not None and profile.path:
+            # In-memory keys win on save; reload so the stale difix.rounds can't shadow augment's
+            from hypersplat.pipeline.params import SceneProfile
+            self.profile = SceneProfile.load(profile.path)
+        torch.cuda.empty_cache()
+        return out_dir
+
+    def _run_training(self, data_dir: Optional[Path], resume_ckpt: Optional[Path] = None,
+                      result_name: str = "acezero_3dgs", extra_args: Optional[list] = None) -> Path:
         """Step 2: MCMC 3DGS Training"""
         logger.info("\nSTEP 2: TRAINING (3DGS MCMC)")
         
-        result_dir = self.config.OUTPUT_BASE / "results" / "acezero_3dgs"
+        result_dir = self.config.OUTPUT_BASE / "results" / result_name
         trainer_script = Path(__file__).resolve().parent.parent.parent / "examples" / "simple_trainer.py"
         
         if not trainer_script.exists():
@@ -609,7 +921,7 @@ class IntelligentPipeline:
 
         cmd = [
             sys.executable, "-u", str(trainer_script), "mcmc",
-            "--data_dir", str(data_dir),
+            *(["--data_dir", str(data_dir)] if data_dir is not None else []),
             "--result_dir", str(result_dir),
             "--max_steps", str(self.config.TRAINING_MAX_STEPS),
             "--data_factor", str(self.config.DATA_FACTOR),
@@ -625,6 +937,7 @@ class IntelligentPipeline:
             "--sh_degree", str(self.config.SH_DEGREE),
             "--means_lr", str(self.config.MEANS_LR),
             "--ssim_lambda", str(self.config.SSIM_LAMBDA),
+            "--test_every", str(self.config.TEST_EVERY),
         ]
 
         if self.config.TRAINING_SAVE_STEPS:
@@ -635,6 +948,19 @@ class IntelligentPipeline:
             cmd.append("--eval_steps")
             cmd.extend([str(s) for s in self.config.TRAINING_EVAL_STEPS])
 
+        if self.config.CAP_MAX:
+            cmd.extend(["--strategy.cap-max", str(self.config.CAP_MAX)])
+
+        # Loss-plateau early stopping (trainer still writes final ckpt/ply/val stats).
+        # Patience / min steps at their CLI defaults (500 / 2000, tuned for 7k steps) are
+        # left to the trainer, which derives them from max_steps (~7% / ~30%).
+        if self.config.EARLY_STOPPING:
+            cmd.append("--early_stopping")
+            cmd.extend(["--early_stop_min_delta", str(self.config.EARLY_STOP_MIN_DELTA)])
+            if self.config.EARLY_STOP_PATIENCE not in (None, 500):
+                cmd.extend(["--early_stop_patience", str(self.config.EARLY_STOP_PATIENCE)])
+            if self.config.EARLY_STOP_MIN_STEPS not in (None, 2000):
+                cmd.extend(["--early_stop_min_steps", str(self.config.EARLY_STOP_MIN_STEPS)])
         if self.config.RANDOM_BKGD: cmd.append("--random_bkgd")
         if self.config.USE_APP_OPT: cmd.append("--app_opt")
         if self.config.WITH_UT: cmd.append("--with_ut")
@@ -650,6 +976,28 @@ class IntelligentPipeline:
         if self.config.GENVS_CKPT:
              cmd.extend(["--genvs_ckpt", str(self.config.GENVS_CKPT)])
              cmd.extend(["--genvs_interval", str(self.config.GENVS_INTERVAL)])
+
+        if self.config.DIFIX_ONLINE:
+            cmd.append("--difix_online")
+        if self.config.SEED is not None:
+            cmd.extend(["--seed", str(self.config.SEED)])
+        if self.config.DETERMINISTIC:
+            cmd.append("--deterministic")
+        if self.config.STREAM and self.config.STREAM_VIEWER_PORT:
+            cmd.remove("--disable_viewer")
+            cmd.extend(["--port", str(self.config.STREAM_VIEWER_PORT)])
+        cmd.extend(extra_args or [])
+        for kv in self.config.TRAINER_ARGS:
+            key, sep, value = kv.partition("=")
+            if not sep or not key:
+                raise ValueError(f"--trainer-arg expects KEY=VALUE, got {kv!r}")
+            key = key.lstrip('-')
+            if value.lower() in ("true", "false"):
+                # tyro booleans are flags: --key / --no-key
+                flag = key.replace("_", "-")
+                cmd.append(f"--{flag}" if value.lower() == "true" else f"--no-{flag}")
+            else:
+                cmd.extend([f"--{key}", value])
 
         if resume_ckpt and resume_ckpt.exists():
             cmd.extend(["--ckpt", str(resume_ckpt)])
@@ -675,6 +1023,97 @@ class IntelligentPipeline:
 
         return result_dir
 
+    def run_stream(self, source: str) -> Dict:
+        """Streaming pipeline: source -> keyframes -> ACE sidecar -> live 3DGS training.
+
+        Poses come from the trainer's ACE sidecar as frames arrive, so there is no separate
+        STEP 1 and no batch refinement loop; online Difix (if enabled) runs inside training.
+        A file source is reconstructed just in time and ends on its own; a live source has no
+        fixed length: max_steps is the initial budget, every new view extends it (the trainer's
+        --stream_extend_steps), and the run ends that long after the last new view or when
+        <result_dir>/STOP is created.
+        """
+        from hypersplat.pipeline.params import PROFILE_ENV, PROFILE_FILENAME, SceneProfile
+        from hypersplat.stream.source import parse_source
+
+        kind, target = parse_source(source)
+        if kind == "file":
+            source = str(target)
+        start_time = time.time()
+        logger.info("=" * 70)
+        logger.info("STREAMING PIPELINE: frames -> ACE sidecar -> live 3DGS")
+        logger.info("=" * 70)
+        logger.info(f"Source: {source} ({kind})")
+        logger.info(f"Output: {self.config.OUTPUT_BASE}")
+        self.config.create_directories()
+        self.profile = SceneProfile.load(self.config.OUTPUT_BASE / PROFILE_FILENAME)
+        self.profile.discard("train", "difix", "decisions", "stream")
+        os.environ[PROFILE_ENV] = str(self.profile.path)
+        if kind == "file":
+            self._record_video_signals(Path(source))
+        self._record_gpu_signals()
+        # The pre_train budget stage needs a frame count a stream doesn't have: without this the
+        # trainer's 1M default applies (near-duplicate keyframes, GPU shared with ACE/Difix)
+        if "CAP_MAX" not in self.config.USER_SET:
+            from hypersplat.pipeline.params.strategies.training_budget import stream_cap_max
+            self.config.CAP_MAX = stream_cap_max(self.profile.get("gpu.free_mb"), 960,
+                                                 difix=bool(self.config.DIFIX_ONLINE))
+            logger.info(f"[Config] Stream Gaussian cap: {self.config.CAP_MAX}")
+
+        # Live sources have no natural end. Like a download's ETA, the total starts from a short
+        # budget and grows with the data: every new view pushes the end to step + extend
+        # (StreamHorizon), and settling coverage pulls it in. Only an explicit step count is a
+        # hard ceiling (--stream_max_steps_cap below). The final step always evals and saves.
+        dynamic = "TRAINING_MAX_STEPS" not in self.config.USER_SET and kind != "file"
+        if dynamic:
+            self.config.TRAINING_MAX_STEPS = LIVE_INITIAL_STEPS
+        steps = self.config.TRAINING_MAX_STEPS
+        if "TRAINING_EVAL_STEPS" not in self.config.USER_SET:
+            self.config.TRAINING_EVAL_STEPS = [] if dynamic else [steps]
+        if "TRAINING_SAVE_STEPS" not in self.config.USER_SET:
+            self.config.TRAINING_SAVE_STEPS = [] if dynamic else [steps]
+        if "POSE_OPT_WARMUP" not in self.config.USER_SET:
+            # Same fraction as the batch budget (the fixed 1000 was half of a 2k run)
+            from hypersplat.pipeline.params.strategies.training_budget import WARMUP_FRACTION
+            self.config.POSE_OPT_WARMUP = int(steps * WARMUP_FRACTION / 10.0 + 0.5) * 10
+        extra = ["--stream_source", source, "--stream_pace", self.config.STREAM_PACE,
+                 "--stream_budget_mb", str(self.config.STREAM_BUDGET_MB)]
+        if not dynamic:
+            extra += ["--ply_steps", str(steps), "--stream_max_steps_cap", str(steps)]
+        if self.config.STREAM_FLIGHT_PORT:
+            extra += ["--stream_flight_port", str(self.config.STREAM_FLIGHT_PORT)]
+        if self.config.STREAM_DASHBOARD_PORT:
+            extra += ["--stream_dashboard_port", str(self.config.STREAM_DASHBOARD_PORT),
+                      "--stream_dashboard_host", self.config.STREAM_DASHBOARD_HOST]
+        if self.config.STREAM_RECORD_SECONDS:
+            extra += ["--stream_record_seconds", str(self.config.STREAM_RECORD_SECONDS)]
+        if self.config.STREAM_RECORD_KEYFRAMES:
+            extra += ["--stream_record_keyframes", str(self.config.STREAM_RECORD_KEYFRAMES)]
+        if self.config.STREAM_DEPTH:
+            extra += ["--stream_depth"]
+        if self.config.STREAM_POSE_OPT:
+            extra += ["--stream_pose_opt"]
+        if self.config.STREAM_BOOTSTRAP_COOLDOWN:
+            extra += ["--stream_bootstrap_cooldown", str(self.config.STREAM_BOOTSTRAP_COOLDOWN)]
+        if self.config.STREAM_MAP_CACHE and kind == "file":
+            extra += ["--stream_map_cache", str(self.config.STREAM_MAP_CACHE)]
+        if self.config.STREAM_EXPOSURE_OPT:
+            extra += ["--stream_exposure_opt"]
+        if self.config.STREAM_TARGET_PSNR:
+            extra += ["--stream_converge_target_psnr", str(self.config.STREAM_TARGET_PSNR)]
+        if self.config.EARLY_STOPPING:
+            logger.info("[Stream] Early stop: training ends once the world is reconstructed "
+                        f"(max_steps {steps} is only a ceiling; --no-early-stopping to disable)")
+        result_dir = self._run_training(None, result_name="stream_3dgs", extra_args=extra)
+
+        if self.config.PRUNE:
+            self._run_floater_pruning(result_dir)
+        cloud_result = self._upload_to_cloud(result_dir) if self.config.CLOUD_SYNC else None
+        elapsed = time.time() - start_time
+        self._print_success(elapsed, result_dir)
+        return {"status": "success", "elapsed": elapsed, "output": str(result_dir),
+                "cloud_sync": cloud_result}
+
     def _run_autoregressive_refinement(self, ace_output: Path, initial_result_dir: Path) -> Path:
         """Step 3: Autoregressive Refinement (The 'Dream' Loop)"""
         logger.info("\nSTEP 3: AUTOREGRESSIVE REFINEMENT")
@@ -691,13 +1130,33 @@ class IntelligentPipeline:
         from hypersplat.beta.genvs.run_completion import GeNVSLite, read_model, mirror_camera_pose, compute_scene_center, qvec2rotmat
         
         # [Governor Loop]
-        max_loops = 3
         current_data_dir = ace_output
         current_result_dir = initial_result_dir
-        
-        for i in range(max_loops):
-            logger.info(f"\n--- Autoregressive Loop {i+1}/{max_loops} ---")
-            
+        visited = [initial_result_dir]
+
+        # Closed-loop signals for this refinement only (the profile may survive a rerun)
+        self.profile.set("difix.rounds", [], "loop-reset")
+        if self.config.GENVS_BACKEND == 'difix':
+            try:
+                from hypersplat.beta.difix.augment import measure_camera_spread
+                spread = measure_camera_spread(ace_output, self.config.TEST_EVERY)
+                self.profile.set("difix.camera_spread_deg", round(spread, 3), "augment.camera_spread_deg")
+            except Exception as e:
+                logger.warning(f"Could not measure camera spread for the Difix angle: {e}")
+
+        # REFINE_LOOPS is re-derived at the start of every loop (early exit on val plateau or
+        # Difix hallucination sets it to the current index), so read it each iteration
+        i = 0
+        while i < self.config.REFINE_LOOPS:
+            self._record_training_signals(current_result_dir)
+            self.profile.set("difix.loop_index", i, "loop")
+            self._apply_param_stage("loop")
+            if i >= self.config.REFINE_LOOPS:
+                logger.info(f"Stopping refinement after {i} loop(s) "
+                            f"({(self.profile.get('decisions.REFINE_LOOPS') or {}).get('reason')})")
+                break
+            logger.info(f"\n--- Autoregressive Loop {i+1}/{self.config.REFINE_LOOPS} ---")
+
             # 1. Ask Governor for marching orders
             action, overrides = self._run_governor(current_data_dir, current_result_dir)
             
@@ -719,7 +1178,8 @@ class IntelligentPipeline:
                 current_data_dir, 
                 current_result_dir, 
                 iter_dir,
-                overrides # Pass governor config to GeNVS?
+                overrides, # Pass governor config to GeNVS?
+                loop_idx=i,
             )
             
             # 3. Re-Train with Governor's Overrides
@@ -731,11 +1191,25 @@ class IntelligentPipeline:
             self.config = self._patch_config(original_config, overrides)
             
             try:
-                current_result_dir = self._run_training(augmented_dir)
+                # Separate result dir per iteration so earlier rounds stay comparable
+                current_result_dir = self._run_training(augmented_dir, result_name=f"refine_iter{i + 1}")
                 current_data_dir = augmented_dir
+                visited.append(current_result_dir)
             finally:
                 self.config = original_config
-                
+            i += 1
+
+        # A loop can make held-out PSNR worse (e.g. Difix round 1 on the drone: 23.53 -> 23.41);
+        # hand the best reconstruction downstream rather than simply the last one
+        self._record_training_signals(current_result_dir)
+        from hypersplat.pipeline.params.strategies.difix import final_val_psnrs
+        scores = {k: v for k, v in final_val_psnrs(self.profile) if k in {str(d) for d in visited}}
+        if len(scores) == len(visited) and str(current_result_dir) in scores:
+            best = max(visited, key=lambda d: scores[str(d)])
+            if scores[str(best)] > scores[str(current_result_dir)]:
+                logger.info(f"Using {best} (held-out PSNR {scores[str(best)]:.2f}) instead of the last "
+                            f"loop's {current_result_dir} ({scores[str(current_result_dir)]:.2f})")
+                current_result_dir = best
         return current_result_dir
 
     def _run_governor(self, data_dir: Path, result_dir: Path):
@@ -792,7 +1266,8 @@ class IntelligentPipeline:
                 setattr(new_config, key, v)
         return new_config
 
-    def _perform_genvs_refinement(self, ace_output, initial_result_dir, iter_dir, overrides) -> Path:
+    def _perform_genvs_refinement(self, ace_output, initial_result_dir, iter_dir, overrides,
+                                  loop_idx: int = 0) -> Path:
         import torch
         import cv2
         import numpy as np
@@ -800,6 +1275,10 @@ class IntelligentPipeline:
         if overrides.get("skip_genvs", False):
              logger.info("  Skipping GeNVS refinement as requested (Wait/Fine-tune mode).")
              return ace_output
+
+        if self.config.GENVS_BACKEND == 'difix':
+            return self._perform_difix_refinement(ace_output, initial_result_dir, iter_dir,
+                                                  overrides, loop_idx)
 
         try:
              from hypersplat.beta.genvs.run_completion import (
@@ -857,8 +1336,7 @@ class IntelligentPipeline:
         logger.info("  Sampling 3D latent space (Rendering)...")
         trainer_script = Path(__file__).resolve().parent.parent.parent / "examples" / "simple_trainer.py"
         ckpt_dir = initial_result_dir / "ckpts"
-        ckpts = sorted(ckpt_dir.glob("*.pt"), key=lambda p: int(p.stem.split('_')[1]))
-        latest_ckpt = ckpts[-1]
+        latest_ckpt = find_newest_ckpt(ckpt_dir, "*.pt")
         
         cmd_render = [
             sys.executable, str(trainer_script), "mcmc",
@@ -874,17 +1352,62 @@ class IntelligentPipeline:
         rendered_img_path = initial_result_dir / "renders" / "custom_render.png"
         
         # 3. GeNVS Refinement
+        # NOTE: GeNVSLite has no depth-based warping fallback - it runs the same untrained
+        # GeNVSPipeline diffusion model as the "Core" path, and without a real trained
+        # checkpoint this produces pure noise (see the analogous guard in
+        # _run_novel_view_generation). Rather than let that noise overwrite the perfectly
+        # valid `rendered_img_path` draft we just rendered directly from the trained 3DGS
+        # model above, skip the "refinement" step and inject that real draft render as-is
+        # when no checkpoint is available.
+        ckpt_path = None
+        if self.config.GENVS_CKPT and Path(self.config.GENVS_CKPT).exists():
+            ckpt_path = self.config.GENVS_CKPT
+        else:
+            ckpt_dir = Path("results/genvs_train/checkpoints")
+            if ckpt_dir.exists():
+                ckpts_found = sorted(ckpt_dir.glob("step_*.pt"),
+                                     key=lambda p: int(p.stem.split("_")[1]))
+                if ckpts_found:
+                    ckpt_path = str(ckpts_found[-1])
+
+        if not ckpt_path:
+            logger.warning(
+                "  [GeNVS-Lite] No trained GeNVS checkpoint found - skipping diffusion "
+                "refinement (it would only produce noise) and injecting the rendered 3DGS "
+                "draft view as-is instead."
+            )
+            refined_path = iter_dir / "refined_back_0000.png"
+            shutil.copy2(rendered_img_path, refined_path)
+
+            logger.info("  Injecting refined view...")
+            temp_novel_dir = iter_dir / "novel_temp"
+            temp_novel_dir.mkdir(exist_ok=True)
+            shutil.copy2(refined_path, temp_novel_dir / "novel_0.png")
+
+            augmented_dir = inject_autoregressive_back_views(
+                ace_output=ace_output,
+                initial_result_dir=initial_result_dir,
+                iter_dir=iter_dir,
+                overrides=overrides
+            )
+            if self.config.DATA_FACTOR > 1:
+                from hypersplat.pipeline.wrappers.perception import ACEZeroPoseEstimator
+                ACEZeroPoseEstimator(output_dir=augmented_dir).create_downsampled_images(
+                    factors=[self.config.DATA_FACTOR]
+                )
+            return augmented_dir
+
         logger.info("  Refining sample with GeNVS...")
-        
+
         genvs = None
         src_img_t = None
         src_pose_t = None
         novel_view_np = None
-        
+
         try:
             # Use the already imported GeNVSLite
-            genvs = GeNVSLite() # No use_zoedepth in our current implementation
-            
+            genvs = GeNVSLite(checkpoint_path=ckpt_path)
+
             front_img_bgr = cv2.imread(str(ace_output / "images" / ref_image.name))
             front_img = cv2.cvtColor(front_img_bgr, cv2.COLOR_BGR2RGB)
             
@@ -927,19 +1450,34 @@ class IntelligentPipeline:
             
             # 4. Inject into Dataset
             logger.info("  Injecting refined view...")
-            augmented_dir = self.config.OUTPUT_BASE / f"acezero_output_autoregressive_{iter_dir.name}"
-            
+
             temp_novel_dir = iter_dir / "novel_temp"
             temp_novel_dir.mkdir(exist_ok=True)
             shutil.copy2(refined_path, temp_novel_dir / "novel_0.png")
-            
-            # Use the already imported inject_autoregressive_back_views
-            inject_autoregressive_back_views(
+
+            # Use the already imported inject_autoregressive_back_views.
+            # Its return value is the actual augmented dataset directory it created
+            # (named `acezero_output_aug_{iter_dir.name}`) - use it directly rather than
+            # independently recomputing a path, which previously drifted out of sync
+            # (guessed `acezero_output_autoregressive_{iter_dir.name}`, which was never created).
+            augmented_dir = inject_autoregressive_back_views(
                 ace_output=ace_output,
                 initial_result_dir=initial_result_dir,
                 iter_dir=iter_dir,
                 overrides=overrides
             )
+
+            # inject_autoregressive_back_views only writes full-resolution images/, but
+            # _run_training's --data_factor (when >1) requires a pre-existing images_{factor}
+            # dir to exist (examples/datasets/colmap.py's Parser checks for it before it will
+            # generate the resized variant) - without this, retraining on the augmented
+            # dataset fails with "Image folder .../images_2 does not exist."
+            if self.config.DATA_FACTOR > 1:
+                from hypersplat.pipeline.wrappers.perception import ACEZeroPoseEstimator
+                ACEZeroPoseEstimator(output_dir=augmented_dir).create_downsampled_images(
+                    factors=[self.config.DATA_FACTOR]
+                )
+
             return augmented_dir
         finally:
             logger.info("Cleaning up GeNVS model resources in autoregressive loop...")
@@ -1043,18 +1581,20 @@ def main():
     parser = argparse.ArgumentParser(description="Condensed Intelligent 3DPipeline")
     
     # Core
-    parser.add_argument("video_path", help="Input video file")
+    parser.add_argument("video_path", help="Input video file (with --stream: any stream source spec)")
     parser.add_argument("--output_dir", default="data/output_3dgs", help="Output root")
-    parser.add_argument("--fps", type=float, default=10.0, help="Extraction FPS")
-    parser.add_argument("--data_factor", type=int, default=2, help="Downsample factor")
+    parser.add_argument("--fps", type=float, default=None, help="Extraction FPS (default: auto, fallback 10)")
+    parser.add_argument("--data_factor", type=int, default=None, help="Downsample factor (default: auto, fallback 2)")
     
     # Training
-    parser.add_argument("--max_steps", type=int, default=7000, help="Training steps")
+    parser.add_argument("--max_steps", type=int, default=None, help="Training steps (default: auto, fallback 7000)")
     parser.add_argument("--with_ut", action="store_true", help="Uncertainty Training")
     parser.add_argument("--with_eval3d", action="store_true", help="3D Evaluation")
     
     # Tuning
-    parser.add_argument("--init_scale", type=float, default=2.5)
+    parser.add_argument("--init_scale", type=float, default=None, help="Default: auto, fallback 2.5")
+    parser.add_argument("--cap-max", dest="cap_max", type=int, default=None,
+                        help="Max Gaussians for MCMC (trainer default 1M; ~300k suits short captures)")
     parser.add_argument("--opacity_reg", type=float, default=0.05)
     parser.add_argument("--scale_reg", type=float, default=0.05)
     parser.add_argument("--app_opt", action="store_true")
@@ -1075,12 +1615,59 @@ def main():
                         help="Enable streaming mode: start 3DGS training while ACE-Zero is running")
     parser.add_argument("--unified_stream", action="store_true",
                         help="Alias for --streaming --quality-mode fast")
+    parser.add_argument("--stream", action="store_true",
+                        help="Streaming pipeline: video_path is a source spec (video file, camera "
+                             "index, /dev/videoN, rtsp/http URL or flight://host:port); frames are "
+                             "posed by an ACE sidecar and trained on as they arrive, in memory")
+    parser.add_argument("--stream-pace", dest="stream_pace", choices=["auto", "realtime", "fast"],
+                        default="auto", help="auto: files as fast as training consumes, cameras live")
+    parser.add_argument("--stream-budget-mb", dest="stream_budget_mb", type=float, default=384.0,
+                        help="Memory budget of the keyframe store (encoded frames + pseudo views)")
+    parser.add_argument("--stream-flight-port", dest="stream_flight_port", type=int, default=None,
+                        help="Also serve live views/stats over Arrow Flight on this port")
+    parser.add_argument("--stream-viewer-port", dest="stream_viewer_port", type=int, default=None,
+                        help="Open the viser 3DGS viewer on this port while a stream trains")
+    parser.add_argument("--stream-dashboard-port", dest="stream_dashboard_port", type=int, default=None,
+                        help="Serve the live dashboard (3D viewer left, camera feed right) on this port")
+    parser.add_argument("--stream-dashboard-host", dest="stream_dashboard_host", default="127.0.0.1",
+                        help="Dashboard bind address (0.0.0.0 exposes the camera feed on the network)")
+    parser.add_argument("--stream-record-seconds", dest="stream_record_seconds", type=float, default=None,
+                        help="Stop recording a live source after this many seconds (training continues)")
+    parser.add_argument("--stream-record-keyframes", dest="stream_record_keyframes", type=int, default=None,
+                        help="Stop recording a live source after this many keyframes (training continues)")
+    parser.add_argument("--stream-depth", dest="stream_depth", action="store_true",
+                        help="Dense depth per keyframe (Depth Anything V2 Small aligned to ACE points): "
+                             "denser seeding and a depth loss")
+    parser.add_argument("--trainer-arg", dest="trainer_arg", action="append", metavar="KEY=VALUE",
+                        help="Pass a trainer option through (e.g. ssim_lambda=0.3, strategy.cap-max=200000); "
+                             "repeatable, applied last so it overrides the pipeline's value")
+    parser.add_argument("--stream-bootstrap-cooldown", dest="stream_bootstrap_cooldown", type=int, default=None,
+                        help="Cap the first ACE map's cooldown iterations (sooner first map)")
+    parser.add_argument("--stream-map-cache", dest="stream_map_cache", default=None,
+                        help="File sources: keep the first ACE map in this directory and reuse it on "
+                             "later runs of the same file (A/B runs on one map, no bootstrap wait)")
+    parser.add_argument("--stream-pose-opt", dest="stream_pose_opt", action="store_true",
+                        help="Refine each keyframe's ACE pose during stream training")
+    parser.add_argument("--stream-exposure-opt", dest="stream_exposure_opt", action="store_true",
+                        help="Learn a per-keyframe exposure gain/bias (camera auto-exposure)")
+    parser.add_argument("--stream-target-psnr", dest="stream_target_psnr", type=float, default=None,
+                        help="Stream early stop: held-out PSNR (dB) that counts as adequately "
+                             "reconstructed once gains flatten (default 22)")
+    parser.add_argument("--difix-online", dest="difix_online", action="store_true",
+                        help="Run Difix rounds inside training (replaces the STEP 3 retrain loop)")
+    parser.add_argument("--deterministic", action="store_true",
+                        help="Reproducible training: deterministic kernels and inline view sampling; "
+                             "stream runs also localize a file fully before step 0 and train ACE "
+                             "maps deterministically. Slower; measured ~0.17 dB lower on drone 2k")
     parser.add_argument("--streaming_check_interval", type=int, default=1000,
                         help="Interval to check for new poses in streaming mode (default: 1000)")
 
     # Floater Pruning
-    parser.add_argument("--prune", action="store_true", default=True,
-                        help="Run floater pruning post-processing (default: True)")
+    # Off by default: the context-aware heuristic costs ~2 dB held-out PSNR on the drone
+    # scene (removes visible and saturated-colour Gaussians) and strips the periphery that
+    # Difix pseudo views fill in. It was also silently skipped before plyfile was installed.
+    parser.add_argument("--prune", action="store_true", default=False,
+                        help="Run heuristic floater pruning on the exported PLY (default: off)")
     parser.add_argument("--no-prune", dest="prune", action="store_false",
                         help="Disable floater pruning")
     parser.add_argument("--prune-model", dest="prune_model", type=str, default=None,
@@ -1091,19 +1678,29 @@ def main():
                         help="Enable GeNVS-Lite to generate synthetic novel views for data augmentation")
     parser.add_argument("--genvs-views", dest="genvs_views", type=int, default=20,
                         help="Number of novel views to generate (default: 20)")
+    parser.add_argument("--genvs-backend", dest="genvs_backend", choices=["difix", "core"], default="difix",
+                        help="Generative model for the GeNVS slots: pretrained Difix (default) or in-repo GeNVS core")
+    parser.add_argument("--difix", action="store_true",
+                        help="Shorthand for --genvs-autoregressive --genvs-backend difix")
+    parser.add_argument("--refine-loops", "--difix-rounds", dest="refine_loops", type=int, default=None,
+                        help="Iterations of the 3DGS <-> GeNVS feedback loop")
+    parser.add_argument("--difix-views", dest="difix_views", type=int, default=None)
+    parser.add_argument("--difix-max-angle", dest="difix_max_angle", type=float, default=None)
+    parser.add_argument("--difix-pseudo-weight", dest="difix_pseudo_weight", type=float, default=None)
     parser.add_argument("--genvs_ckpt", type=str, default=None, help="Path to GeNVS checkpoint for Autoregressive Injection")
     parser.add_argument("--genvs_interval", type=int, default=1000, help="Interval for GeNVS injection (default: 1000)")
     parser.add_argument("--skip-ace", action="store_true", help="Skip ACE-Zero pose estimation (use existing)")
     
     # Reproducibility
-    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Random seed for reproducibility (this process and the trainer; trainer default 42)")
 
     # JOGS-style Pose Optimization
     parser.add_argument("--pose-opt", dest="pose_opt", action="store_true", default=True,
                         help="Enable JOGS-style joint pose-3DGS optimization (default: True)")
     parser.add_argument("--no-pose-opt", dest="pose_opt", action="store_false",
                         help="Disable pose optimization (use fixed ACE-Zero poses)")
-    parser.add_argument("--pose-opt-warmup", dest="pose_opt_warmup", type=int, default=1000,
+    parser.add_argument("--pose-opt-warmup", dest="pose_opt_warmup", type=int, default=None,
                         help="Steps before pose optimization starts (default: 1000)")
 
     # Autoregressive GeNVS
@@ -1129,7 +1726,7 @@ def main():
                         help="ACE-Zero quality mode: fast (speed), balanced (default), quality (max accuracy)")
     
     # === NEW: Pose Confidence Filtering ===
-    parser.add_argument("--min-registration-confidence", dest="min_registration_confidence", type=int, default=1000,
+    parser.add_argument("--min-registration-confidence", dest="min_registration_confidence", type=int, default=None,
                         help="Minimum pose confidence threshold (poses below this are filtered)")
     
     # === NEW: Early Stopping ===

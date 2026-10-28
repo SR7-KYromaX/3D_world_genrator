@@ -36,6 +36,35 @@ logger = logging.getLogger(__name__)
 # And project root is .parent.parent.parent.parent
 ACEZERO_ROOT = Path(__file__).parent.parent.parent.parent / "scripts" / "acezero"
 
+DEFAULT_ACEZERO_ENV = Path(__file__).resolve().parents[4] / ".conda_envs" / "ace0"
+
+
+def acezero_python_env(acezero_root: Path) -> Tuple[str, Dict[str, str]]:
+    """Interpreter + environment for native ACE-Zero subprocesses (also the streaming sidecar).
+
+    Resolution: $HYPERSPLAT_ACEZERO_PYTHON, then the sibling `.conda_envs/ace0`
+    env, then the current interpreter.
+    """
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(acezero_root) + os.pathsep + env.get("PYTHONPATH", "")
+
+    python = os.environ.get("HYPERSPLAT_ACEZERO_PYTHON")
+    if not python:
+        candidate = DEFAULT_ACEZERO_ENV / "bin" / "python"
+        python = str(candidate) if candidate.exists() else sys.executable
+
+    if python != sys.executable:
+        # Point PATH at the env so ace_zero_hybrid's own child calls (sys.executable)
+        # and any tools stay inside it.
+        env["PATH"] = str(Path(python).parent) + os.pathsep + env.get("PATH", "")
+        # dsacstar in ace0 was compiled with the system GCC and needs symbols
+        # (__cxa_call_terminate) missing from conda's older libstdc++.
+        system_libstdcxx = "/usr/lib64/libstdc++.so.6"
+        if os.path.exists(system_libstdcxx) and "LD_PRELOAD" not in env:
+            env["LD_PRELOAD"] = system_libstdcxx
+    return python, env
+
+
 class ACEZeroPoseEstimator:
     """Wrapper for ACE-Zero pose estimation."""
     
@@ -64,13 +93,13 @@ class ACEZeroPoseEstimator:
         # Adaptive ACE-Zero settings
         self.quality_mode = quality_mode  # 'fast', 'balanced', 'quality'
         self.min_confidence = min_confidence  # Filter poses below this confidence
+        # None = infer: a value other than the auto fallback (1000), or the CLI flag, means the
+        # user set it (applied as-is); otherwise _filter_poses may lower it to the outlier boundary.
+        self.min_confidence_user_set = None
         self.video_info = {}  # Populated by _analyze_video()
         
-        # New adaptive options defaults
-        self.cooldown_iterations = 5000
-        self.cooldown_threshold = 0.7
-        self.aug_rotation = 15
-        self.registration_threshold = 0.99
+        # ACE-Zero schedule; filled from measured signals by _compute_adaptive_params()
+        self.ace_params = {}
         
         # Depth model selection: 'depth_anything' (default, fast), 'zoedepth' (metric), 'midas' (lightweight)
         self.depth_model = depth_model if depth_model in self.DEPTH_MODELS else 'depth_anything'
@@ -194,75 +223,46 @@ class ACEZeroPoseEstimator:
         return info
     
     def _compute_adaptive_params(self):
-        """Compute ACE-Zero parameters based on video analysis and quality mode."""
-        avg_motion = self.video_info.get('avg_motion', 15)
-        frame_count = self.video_info.get('frame_count', 100)
-        duration = self.video_info.get('duration', 10)
-        
-        # === Motion-based adjustments ===
-        if avg_motion > 30:
-            self.repro_loss_soft_clamp = 30
-            self.registration_confidence = 1500
-            self.adaptive_try_seeds = 10
-        elif avg_motion > 15:
-            self.repro_loss_soft_clamp = 40
-            self.registration_confidence = 1000
-            self.adaptive_try_seeds = 7
-        else:
-            self.repro_loss_soft_clamp = 50
-            self.registration_confidence = 500
-            self.adaptive_try_seeds = 5
-        
-        # === Quality mode adjustments ===
-        if self.quality_mode == "fast":
-            self.seed_iterations = 3000   # Coarse seed (V2 optimized)
-            self.refit_iterations = 10000  # Lean final mapping
-            self.learning_rate_max = 0.006 # Higher LR for faster convergence
-            self.cooldown_threshold = 0.75
-            self.cooldown_iterations = 2000
-            self.aug_rotation = 5
-            self.registration_threshold = 0.95
-        elif self.quality_mode == "quality":
-            self.seed_iterations = 10000  # High-quality seed
-            self.refit_iterations = 50000 # Exhaustive mapping
-            self.learning_rate_max = 0.003
-            self.cooldown_threshold = 0.6
-            self.cooldown_iterations = 5000
-            self.aug_rotation = 15
-            self.registration_threshold = 0.99
-        else: # balanced
-            self.seed_iterations = 5000
-            self.refit_iterations = 18000
-            self.learning_rate_max = 0.004
-            self.cooldown_threshold = 0.7
-            self.cooldown_iterations = 4000
-            self.aug_rotation = 10
-            self.registration_threshold = 0.99
-        
-        # Scale iterations by expected frames
-        expected_frames = getattr(self, 'num_frames', frame_count // 10)
-        # The original `base_iterations` logic is now replaced by `seed_iterations` and `refit_iterations`
-        # The `adaptive_iterations` variable is no longer directly used for ACE-Zero's main loop,
-        # as ACE-Zero now uses `seed_iterations` and `refit_iterations` for its two main phases.
-        # Keeping `adaptive_iterations` for potential future use or if other parts of the code still reference it.
-        self.adaptive_iterations = self.seed_iterations + self.refit_iterations # Sum of seed and refit iterations
-        self.adaptive_iterations = min(100000, self.adaptive_iterations)
-        
-        # === Hybrid mode parameters ===
-        if self.use_hybrid:
-            if self.quality_mode == "fast":
-                self.hybrid_train_iterations = 8000
-                self.hybrid_pose_wait = 1000
-            elif self.quality_mode == "quality":
-                self.hybrid_train_iterations = 25000
-                self.hybrid_pose_wait = 3000
-            else:  # balanced
-                self.hybrid_train_iterations = 15000
-                self.hybrid_pose_wait = 2000
-        
-        logger.info(f"Adaptive Params [mode={self.quality_mode}, motion={avg_motion:.1f}]: "
-                    f"repro_clamp={self.repro_loss_soft_clamp}, reg_conf={self.registration_confidence}, "
-                    f"seeds={self.adaptive_try_seeds}, iters={self.adaptive_iterations}")
+        """Compute ACE-Zero parameters from measured signals (see params/strategies/ace_schedule.py).
+
+        Smooth functions of avg_motion, num_frames, extracted frame size, CPU count and free
+        VRAM; quality_mode picks the preset each schedule scales. Every value is logged as a
+        `[param] ACE_*` decision and recorded in the scene profile.
+        """
+        from hypersplat.pipeline.params import SceneProfile, record
+        from hypersplat.pipeline.params import signals
+        from hypersplat.pipeline.params.strategies import ace_schedule
+
+        profile = SceneProfile.from_env()
+        avg_motion = self.video_info.get('avg_motion')
+        if avg_motion is None and profile is not None:
+            avg_motion = profile.get("video.avg_motion")
+        num_frames = getattr(self, 'num_frames', None) or self.video_info.get('frame_count', 100) // 10
+
+        free_mb = profile.get("gpu.free_mb") if profile is not None else None
+        if free_mb is None:
+            mem = signals.gpu_memory()
+            free_mb = mem[0] if mem else None
+
+        decisions = ace_schedule.compute_schedule(
+            avg_motion, num_frames, frame_width=self.image_width, frame_height=self.image_height,
+            quality_mode=self.quality_mode, cpu_count=os.cpu_count(), free_mb=free_mb)
+        for name, decision in decisions.items():
+            record(f"ACE_{name.upper()}", decision, profile)
+        if profile is not None:
+            profile.save()
+
+        self.ace_params = {name: d.value for name, d in decisions.items()}
+        # Mirror as attributes (dump_config and older callers read them)
+        for name, value in self.ace_params.items():
+            setattr(self, name, value)
+        self.max_iterations = self.ace_params["iterations_max"]
+        self.adaptive_iterations = min(100000, self.seed_iterations + self.refit_iterations)
+
+        logger.info(f"Adaptive Params [mode={self.quality_mode}, motion={ace_schedule._fmt(avg_motion)}, "
+                    f"frames={num_frames}]: repro_clamp={self.repro_loss_soft_clamp}, "
+                    f"reg_conf={self.registration_confidence}, seeds={self.try_seeds}, "
+                    f"image_res={self.image_resolution}, iters={self.adaptive_iterations}")
         if self.use_hybrid:
             logger.info(f"Hybrid Mode: train_iters={self.hybrid_train_iterations}, pose_wait={self.hybrid_pose_wait}")
     
@@ -272,28 +272,46 @@ class ACEZeroPoseEstimator:
         This is the SINGLE authoritative filter in the pipeline.
         It removes entries from self.poses so that write_colmap_format()
         only outputs good poses to the binary files consumed by 3DGS.
+
+        Threshold (MIN_REGISTRATION_CONFIDENCE): the user's value as-is, else
+        min(min_confidence, median - k*MAD of this scene's confidences), never dropping
+        more than 20% of the frames (ace_schedule.robust_min_confidence).
         
         Returns: (good_count, bad_count, filtered_path_or_None)
         """
+        from hypersplat.pipeline.params import SceneProfile, resolve
+        from hypersplat.pipeline.params.strategies import ace_schedule
+
         pose_file = self.acezero_output / "poses_final.txt"
         if not pose_file.exists():
             return (0, 0, None)
+
+        with open(pose_file, 'r') as f:
+            lines = f.readlines()
+        confs = [float(l.split()[-1]) for l in lines if len(l.split()) >= 10]
+
+        user_set = self.min_confidence_user_set
+        if user_set is None:
+            user_set = (self.min_confidence != ace_schedule.DEFAULT_MIN_CONFIDENCE
+                        or any(a.startswith("--min_registration_confidence") for a in sys.argv))
+        profile = SceneProfile.from_env()
+        threshold = resolve(
+            "MIN_REGISTRATION_CONFIDENCE", self.min_confidence if user_set else None,
+            (lambda: ace_schedule.robust_min_confidence(confs, self.min_confidence)) if confs else None,
+            self.min_confidence, profile)
+        if profile is not None:
+            profile.set("ace.min_conf_used", threshold, "_filter_poses")
+            profile.save()
         
         # Build a set of image names that fail the confidence check
         bad_names = set()
         good_lines = []
-        
-        with open(pose_file, 'r') as f:
-            for line in f:
-                parts = line.strip().split()
-                if len(parts) >= 10:
-                    conf = float(parts[-1])
-                    if conf < self.min_confidence:
-                        bad_names.add(Path(parts[0]).name)
-                    else:
-                        good_lines.append(line)
-                else:
-                    good_lines.append(line)
+        for line in lines:
+            parts = line.strip().split()
+            if len(parts) >= 10 and float(parts[-1]) < threshold:
+                bad_names.add(Path(parts[0]).name)
+            else:
+                good_lines.append(line)
         
         # Actually remove bad poses from self.poses dict
         if bad_names:
@@ -307,15 +325,21 @@ class ACEZeroPoseEstimator:
             filtered_path = self.acezero_output / "poses_final_filtered.txt"
             with open(filtered_path, 'w') as f:
                 f.writelines(good_lines)
-            logger.info(f"Pose Filtering: {after_count} kept, {removed} removed (conf < {self.min_confidence})")
+            logger.info(f"Pose Filtering: {after_count} kept, {removed} removed (conf < {threshold})")
             return (after_count, removed, str(filtered_path))
         
+        logger.info(f"Pose Filtering: all {len(self.poses)} kept (conf >= {threshold})")
         return (len(self.poses), 0, None)
         
-    def process_video(self, video_path: str, fps: float = 2.0, streaming: bool = False) -> bool:
-        """Run the full ACE-Zero pipeline: Frames -> Poses -> COLMAP Format"""
+    def process_video(self, video_path: str, fps: Optional[float] = None, streaming: bool = False) -> bool:
+        """Run the full ACE-Zero pipeline: Frames -> Poses -> COLMAP Format
+
+        fps=None derives the extraction rate from the clip (target frame count x motion).
+        """
         try:
             self._setup_directories()
+            if fps is None:
+                fps = self._auto_fps(video_path)
             self.fps = fps  # Store for parameter calculation
             
             # 0. Analyze video for adaptive parameters
@@ -595,6 +619,16 @@ print('Done! VRAM freed for ACE training.')
             
         return subprocess.CompletedProcess(result.args, result.returncode, stdout=result.stdout if capture_output else "", stderr=result.stderr if capture_output else "")
 
+    def _auto_fps(self, video_path: str) -> float:
+        """FPS from the running pipeline's SceneProfile, or a fresh probe of the video."""
+        from hypersplat.pipeline.params import SceneProfile, resolve, signals
+        from hypersplat.pipeline.params.strategies import extraction
+        profile = SceneProfile.from_env() or SceneProfile()
+        if profile.get("video.duration") is None:
+            for k, v in (signals.probe_video(Path(video_path)) or {}).items():
+                profile.set(f"video.{k}", v, "probe_video")
+        return resolve("FPS", None, lambda: extraction.derive(profile, None), 2.0, profile)
+
     def extract_frames(self, video_path: str, fps: float = 2.0) -> int:
         video_path = Path(video_path)
         if not video_path.exists(): raise FileNotFoundError(f"Video not found: {video_path}")
@@ -610,7 +644,7 @@ print('Done! VRAM freed for ACE training.')
                 import cv2
                 sample = cv2.imread(str(existing_frames[0]))
                 self.image_height, self.image_width = sample.shape[:2]
-                self.focal_length = self.image_width / (2 * np.tan(np.radians(35)))
+                self.focal_length = self._initial_focal(video_path)
                 
                 return len(existing_frames)
             
@@ -627,8 +661,12 @@ print('Done! VRAM freed for ACE training.')
         self.images_dir.mkdir(parents=True, exist_ok=True)
         
         output_pattern = str(self.images_dir / "frame_%05d.jpg")
-        # Scale to max 640 width for optimization (ACE-Zero works well at low res)
-        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(video_path), "-vf", f"fps={fps},scale='min(640,iw)':-1", "-q:v", "2", output_pattern]
+        # Keep source detail up to a VRAM-derived long-side budget (never upscale; ACE-Zero
+        # resizes internally and the trainer's data_factor sets training resolution)
+        from hypersplat.pipeline.params import SceneProfile
+        from hypersplat.pipeline.params.strategies import extraction
+        long_side = extraction.max_long_side(SceneProfile.from_env())
+        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(video_path), "-vf", f"fps={fps},{extraction.scale_filter(long_side)}", "-q:v", "2", output_pattern]
         
         logger.info(f"Extracting frames at {fps} FPS...")
         if subprocess.run(cmd).returncode != 0: raise RuntimeError("FFmpeg extraction failed")
@@ -638,10 +676,25 @@ print('Done! VRAM freed for ACE training.')
             import cv2
             sample = cv2.imread(str(frame_files[0]))
             self.image_height, self.image_width = sample.shape[:2]
-            self.focal_length = self.image_width / (2 * np.tan(np.radians(35))) # ~70 deg HFOV
+            self.focal_length = self._initial_focal(video_path)
             
         logger.info(f"Extracted {len(frame_files)} frames ({self.image_width}x{self.image_height})")
         return len(frame_files)
+
+    def _initial_focal(self, video_path: Path) -> float:
+        """Initial focal (frame px): video 35mm-equiv metadata, else the shared 70-deg HFOV rule.
+
+        Only a starting point: it is handed to ACE-Zero, which refines it during mapping.
+        """
+        from hypersplat.pipeline.params import SceneProfile, record
+        from hypersplat.pipeline.params.strategies import intrinsics
+        f35 = intrinsics.probe_focal_35mm(video_path)
+        decision = intrinsics.initial_focal(self.image_width, self.image_height, f35)
+        profile = SceneProfile.from_env()
+        record("FOCAL_INIT_PX", decision, profile)
+        if profile is not None:
+            profile.save()
+        return float(decision.value)
     
     def run_ace_zero(self, max_iterations: int = None) -> bool:
         """Run ACE-Zero with parameters calculated from frame count."""
@@ -649,58 +702,17 @@ print('Done! VRAM freed for ACE training.')
             logger.error("ACE-Zero not found")
             return False
         
-        # Calculate optimal parameters based on frame count
+        # Parameters scale with frame count, motion, frame size, CPU and VRAM
+        # (_compute_adaptive_params -> params/strategies/ace_schedule.py)
         num_frames = getattr(self, 'num_frames', 30)  # Default to 30 if not set
-        
-        # ===========================================
-        # Individual Complexity-Based Scaling
-        # Each parameter scales on its own curve
-        # ===========================================
-        
-        # Seed Parallel Workers: Aggressively increased for 24-thread CPU
-        # User confirmed wanting to maximize CPU usage for initialization speed.
-        # Balancing against VRAM: 6GB VRAM can handle ~6-8 concurrent tiny networks
-        self.seed_parallel_workers = 8
+        if not self.ace_params:
+            self.num_frames = num_frames
+            self._compute_adaptive_params()
 
-        # Seeds: With more parallel workers, we can afford to try more seeds
-        # Complexity: O(seeds) but parallelized
-        # Scale: sqrt(frames/5), clamped to [4, 12]
-        self.try_seeds = max(4, min(12, int(4 + (num_frames / 30) ** 0.5)))
-        
-        # Iterations: More frames = more images to register per round
-        # Complexity: O(iterations * frames) - linear scaling
-        # Scale: 5 base + log2(frames), clamped to [5, 15]
-        import math
-        calculated_iters = max(5, min(15, int(5 + math.log2(max(1, num_frames)))))
-        self.max_iterations = calculated_iters if calculated_iters else 10  # Ensure never None
-        
-        # Data Workers: CPU parallelism for data loading
-        # User has 24 threads -> can safely increase cap
-        # Complexity: Minor CPU overhead, scales memory slightly
-        # Scale: 4 base + frames/50, clamped to [4, 16]
-        self.num_data_workers = max(4, min(16, int(4 + num_frames / 50)))
-        
-        # Head Blocks: Network depth = map capacity
-        # Complexity: O(blocks * params) - quadratic VRAM impact
-        # Scale: 1 for most cases (6GB VRAM), 2 only for very large datasets
-        self.num_head_blocks = 1 if num_frames < 150 else 2
-        
-        # Training Buffer CPU: Offload training buffer to RAM
-        # Complexity: ~2x slower loading but saves ~1-2GB VRAM
-        # Scale: Force GPU (False) per user request to maximize GPU usage
-        self.training_buffer_cpu = False
-
-        # [OPTIMIZATION] Fast / Streaming Mode Overrides
-        if self.quality_mode == "fast":
-            # Minimize Overhead
-            self.try_seeds = 1             # Single shot mapping (trust first result)
-            self.seed_parallel_workers = 1 # No need for parallelism
-            self.training_buffer_cpu = True # Move buffer to RAM to free VRAM for 3DGS
-            logger.info(f"[Optimization] Fast/Streaming Mode: Reduced overhead (Seeds={self.try_seeds}, CPU Buffer={self.training_buffer_cpu})")
-            
         # Override with explicit max_iterations if provided
         if max_iterations is not None:
             self.max_iterations = max_iterations
+            self.ace_params["iterations_max"] = max_iterations
             
         logger.info(f"ACE-Zero params [frames={num_frames}]: seeds={self.try_seeds}, "
                     f"iters={self.max_iterations}, seed_workers={self.seed_parallel_workers}, "
@@ -708,7 +720,7 @@ print('Done! VRAM freed for ACE training.')
                     f"cpu_buffer={self.training_buffer_cpu}, refinement={self.pose_refinement}")
 
         # [DEBUG] Verify Fast Mode Parameters
-        logger.info(f"ACE-Quality Check: Mode={self.quality_mode}, LR_Max={getattr(self, 'learning_rate_max', 'N/A')}, SeedIters={getattr(self, 'seed_iterations', 'N/A')}")
+        logger.info(f"ACE-Quality Check: Mode={self.quality_mode}, LR_Max={self.learning_rate_max}, SeedIters={self.seed_iterations}")
             
         images_glob = str(self.images_dir.resolve() / "*.jpg")
         output_dir = str(self.acezero_output.resolve())
@@ -772,27 +784,13 @@ print('Done! VRAM freed for ACE training.')
         
         # 2. Run ACE-Zero (uses Depth Anything V2 via modified dataset_io.py)
         logger.info(f"ACE-Zero will use Depth Anything V2 for depth estimation (~30ms/frame)")
-        if self.use_hybrid:
-            # Hybrid mode: single-pass command
-            ace_cmd = (f'{self.docker_python} -u {docker_script} '
-                       f'"{docker_images_src}/*.jpg" {docker_final_output} '
-                       f'--hybrid_train_iterations {getattr(self, "hybrid_train_iterations", 15000)} '
-                       f'--hybrid_pose_wait {getattr(self, "hybrid_pose_wait", 2000)} '
-                       f'--learning_rate_max {getattr(self, "learning_rate_max", 0.003)} '
-                       f'--training_buffer_cpu {self.training_buffer_cpu} '
-                       f'--num_data_workers {self.num_data_workers} '
-                       f'--num_head_blocks {self.num_head_blocks} '
-                       f'--refinement {self.pose_refinement} '
-                       f'--refinement_ortho {self.refinement_ortho} '
-                       f'--pose_refinement_lr {self.pose_refinement_lr} '
-                       f'--cooldown_iterations {self.cooldown_iterations} '
-                       f'--cooldown_threshold {self.cooldown_threshold} '
-                       f'--aug_rotation {self.aug_rotation} '
-                       f'--image_resolution {getattr(self, "image_resolution", 480)} '
-                       f'--registration_confidence {getattr(self, "registration_confidence", 500)}')
-        else:
-            ace_cmd = f'{self.docker_python} -u {docker_script} "{docker_images_src}/*.jpg" {docker_final_output} --iterations_max {getattr(self, "max_iterations", 10)} --seed_iterations {self.seed_iterations} --refit_iterations {self.refit_iterations} --learning_rate_max {getattr(self, "learning_rate_max", 0.003)} --try_seeds {self.try_seeds} --seed_parallel_workers {self.seed_parallel_workers} --training_buffer_cpu {self.training_buffer_cpu} --num_data_workers {self.num_data_workers} --num_head_blocks {self.num_head_blocks} --refinement {self.pose_refinement} --refinement_ortho {self.refinement_ortho} --pose_refinement_wait {self.pose_refinement_wait} --pose_refinement_lr {self.pose_refinement_lr} --cooldown_iterations {self.cooldown_iterations} --cooldown_threshold {self.cooldown_threshold} --aug_rotation {self.aug_rotation} --registration_threshold {self.registration_threshold}'
+        ace_cmd = " ".join([self.docker_python, "-u", docker_script,
+                            f'"{docker_images_src}/*.jpg"', docker_final_output]
+                           + self._ace_cli_args())
         
+        if self.focal_length > 0:
+            # Initial focal hint (metadata or 70-deg HFOV); ACE-Zero still refines it
+            ace_cmd += f' --use_external_focal_length {self.focal_length:.4f}'
         full_cmd = f"{setup_cmd} && {ace_cmd}"
         
         try:
@@ -810,66 +808,74 @@ print('Done! VRAM freed for ACE training.')
             logger.error(f"ACE-Zero (Docker) failed: {e}")
             return False
 
+    # Modules the ACE-Zero subprocesses hard-import (train_ace -> refine_poses/dataset,
+    # register_mapping -> dsacstar). Missing ones otherwise only surface after frame
+    # extraction and pose init, buried in a subprocess traceback.
+    NATIVE_REQUIRED_MODULES = ["torch", "roma", "skimage", "cv2", "dsacstar"]
+
+    # ACE-Zero lives in its own conda env (python 3.8, torch 2.0, compiled dsacstar);
+    # the 3DGS side (.venv_3dgrut) does not have those deps.
+    DEFAULT_ACEZERO_ENV = DEFAULT_ACEZERO_ENV
+
+    def _acezero_python(self) -> Tuple[str, Dict[str, str]]:
+        """Interpreter + environment for native ACE-Zero subprocesses.
+
+        Resolution: $HYPERSPLAT_ACEZERO_PYTHON, then the sibling `.conda_envs/ace0`
+        env, then the current interpreter.
+        """
+        return acezero_python_env(self.acezero_root)
+
+    def _check_native_dependencies(self) -> bool:
+        """Fail fast if the ACE-Zero interpreter can't import a required module."""
+        python, env = self._acezero_python()
+        probe = (
+            "import importlib, sys\n"
+            "for m in sys.argv[1:]:\n"
+            "    try: importlib.import_module(m)\n"
+            "    except Exception as e: print(f'{m}: {e}')\n"
+        )
+        result = subprocess.run(
+            [python, "-c", probe, *self.NATIVE_REQUIRED_MODULES],
+            cwd=str(self.acezero_root), env=env, capture_output=True, text=True,
+        )
+        failures = [l for l in result.stdout.splitlines() if l.strip()]
+        if result.returncode == 0 and not failures:
+            logger.info(f"ACE-Zero interpreter: {python}")
+            return True
+        logger.error(f"ACE-Zero cannot run with interpreter {python}:")
+        for line in failures or [result.stderr.strip()]:
+            logger.error(f"  {line}")
+        logger.error(
+            f"  Set HYPERSPLAT_ACEZERO_PYTHON to an env with ACE-Zero deps "
+            f"(default: {self.DEFAULT_ACEZERO_ENV}/bin/python)."
+        )
+        return False
+
+    def _ace_cli_args(self) -> List[str]:
+        """ACE-Zero options for the selected script: the computed schedule + refinement settings."""
+        from hypersplat.pipeline.params.strategies import ace_schedule
+        values = dict(self.ace_params)
+        values.update(refinement=self.pose_refinement, refinement_ortho=self.refinement_ortho,
+                      pose_refinement_wait=self.pose_refinement_wait,
+                      pose_refinement_lr=self.pose_refinement_lr)
+        return ace_schedule.build_ace_args(values, hybrid=self.use_hybrid)
+
     def _run_ace_zero_native(self, images_glob: str, output_dir: str, acezero_script: str, max_iterations: int) -> bool:
         """Run ACE-Zero natively on Linux (Docker or bare metal)."""
-        # Ensure all parameters have valid defaults
-        iters = max_iterations if max_iterations else getattr(self, 'max_iterations', 10)
-        try_seeds = getattr(self, 'try_seeds', 3)
-        seed_workers = getattr(self, 'seed_parallel_workers', 1)
-        training_buffer = getattr(self, 'training_buffer_cpu', True)
-        data_workers = getattr(self, 'num_data_workers', 2)
-        head_blocks = getattr(self, 'num_head_blocks', 1)
-        refinement = getattr(self, 'pose_refinement', 'mlp')
-        refinement_ortho = getattr(self, 'refinement_ortho', 'gram-schmidt')
-        refinement_wait = getattr(self, 'pose_refinement_wait', 5000)
-        refinement_lr = getattr(self, 'pose_refinement_lr', 0.001)
+        cmd = [sys.executable, "-u", acezero_script, images_glob, output_dir] + self._ace_cli_args()
         
-        if self.use_hybrid:
-            cmd = [
-                sys.executable, "-u", acezero_script,
-                images_glob, output_dir,
-                "--hybrid_train_iterations", str(getattr(self, 'hybrid_train_iterations', 15000)),
-                "--hybrid_pose_wait", str(getattr(self, 'hybrid_pose_wait', 2000)),
-                "--learning_rate_max", str(getattr(self, 'learning_rate_max', 0.003)),
-                "--training_buffer_cpu", str(training_buffer),
-                "--num_data_workers", str(data_workers),
-                "--num_head_blocks", str(head_blocks),
-                "--refinement", str(refinement),
-                "--refinement_ortho", str(refinement_ortho),
-                "--pose_refinement_lr", str(refinement_lr),
-                "--cooldown_iterations", str(getattr(self, 'cooldown_iterations', 5000)),
-                "--cooldown_threshold", str(getattr(self, 'cooldown_threshold', 0.7)),
-                "--aug_rotation", str(getattr(self, 'aug_rotation', 15)),
-                "--image_resolution", str(getattr(self, 'image_resolution', 480)),
-                "--registration_confidence", str(getattr(self, 'registration_confidence', 500)),
-            ]
-        else:
-            cmd = [
-                sys.executable, "-u", acezero_script,
-                images_glob, output_dir,
-                "--iterations_max", str(iters),
-                "--seed_iterations", str(self.seed_iterations),
-                "--refit_iterations", str(self.refit_iterations),
-                "--try_seeds", str(try_seeds),
-                "--seed_parallel_workers", str(seed_workers),
-                "--training_buffer_cpu", str(training_buffer),
-                "--num_data_workers", str(data_workers),
-                "--num_head_blocks", str(head_blocks),
-                "--refinement", str(refinement),
-                "--refinement_ortho", str(refinement_ortho),
-                "--pose_refinement_wait", str(refinement_wait),
-                "--pose_refinement_lr", str(refinement_lr),
-                "--cooldown_iterations", str(getattr(self, 'cooldown_iterations', 5000)),
-                "--cooldown_threshold", str(getattr(self, 'cooldown_threshold', 0.7)),
-                "--aug_rotation", str(getattr(self, 'aug_rotation', 15)),
-                "--registration_threshold", str(getattr(self, 'registration_threshold', 0.99)),
-            ]
-        
-        logger.info(f"[Native Linux] Running ACE-Zero: iters={iters}, seeds={try_seeds}, refinement={refinement}")
-        
-        env = os.environ.copy()
-        env["PYTHONPATH"] = str(self.acezero_root) + os.pathsep + env.get("PYTHONPATH", "")
-        
+        if self.focal_length > 0:
+            # Initial focal hint (metadata or 70-deg HFOV); ACE-Zero still refines it
+            cmd += ["--use_external_focal_length", f"{self.focal_length:.4f}"]
+
+        if not self._check_native_dependencies():
+            return False
+
+        logger.info(f"[Native Linux] Running ACE-Zero: {' '.join(cmd[3:])}")
+
+        python, env = self._acezero_python()
+        cmd[0] = python
+
         try:
             subprocess.run(cmd, cwd=str(self.acezero_root), env=env, check=True)
             self.refine_poses_native()
@@ -887,15 +893,28 @@ print('Done! VRAM freed for ACE training.')
         fpath = self.acezero_output / "poses_final.txt"
         if fpath.exists():
             try:
+                focals = []
                 with open(fpath, 'r') as f:
                     for line in f:
                         tokens = line.split()
                         if len(tokens) == 10:
+                            focals.append(float(tokens[8]))
                             q = [float(tokens[2]), float(tokens[3]), float(tokens[4]), float(tokens[1])] # x,y,z,w
                             t = np.array([float(tokens[5]), float(tokens[6]), float(tokens[7])])
                             R = Rotation.from_quat(q).as_matrix()
                             w2c = np.eye(4); w2c[:3,:3] = R; w2c[:3,3] = t
                             self.poses[Path(tokens[0]).name] = np.linalg.inv(w2c)
+                if focals:
+                    # ACE-Zero refines the focal length (in original-image pixels); the value
+                    # set at frame extraction is only the initial guess (metadata / 70-deg HFOV)
+                    from hypersplat.pipeline.params import SceneProfile, resolve
+                    from hypersplat.pipeline.params.strategies import intrinsics
+                    profile = SceneProfile.from_env()
+                    self.focal_length = float(resolve(
+                        "FOCAL_PX", None, lambda: intrinsics.refined_focal(focals, self.focal_length),
+                        self.focal_length, profile))
+                    if profile is not None:
+                        profile.save()
                 return len(self.poses) > 0
             except Exception as e: logger.error(f"Parse error: {e}")
 
@@ -926,7 +945,7 @@ print('Done! VRAM freed for ACE training.')
         imgs = self._windows_to_docker_path(str(self.images_dir))
         out = self._windows_to_docker_path(str(self.sparse_dir / "points3D.bin"))
         
-        cmd = f"{self.docker_python} -u {script} '{poses}' '{imgs}' '{out}'"
+        cmd = f"{self.docker_python} -u {script} '{poses}' '{imgs}' '{out}' --depth_model {self.depth_model}"
         try:
              res = self._run_docker_command(cmd, check=False, capture_output=True)
              if (self.sparse_dir / "points3D.bin").stat().st_size > 1000: return True
@@ -949,9 +968,10 @@ print('Done! VRAM freed for ACE training.')
         imgs = str(self.images_dir)
         out = str(self.sparse_dir / "points3D.bin")
         
-        cmd = [sys.executable, "-u", str(script), poses, imgs, out]
+        python, env = self._acezero_python()
+        cmd = [python, "-u", str(script), poses, imgs, out, "--depth_model", self.depth_model]
         try:
-            subprocess.run(cmd, check=True, cwd=str(self.acezero_root), timeout=600)
+            subprocess.run(cmd, check=True, cwd=str(self.acezero_root), env=env, timeout=600)
             if (self.sparse_dir / "points3D.bin").stat().st_size > 1000:
                 return True
             logger.error("Native Point Gen: output too small")
@@ -978,7 +998,10 @@ print('Done! VRAM freed for ACE training.')
         return True
 
     def write_colmap_format(self) -> bool:
-        logger.info("Writing COLMAP output...")
+        # Focal: ACE-Zero refined median (see _parse_acezero_output). Principal point: image
+        # centre, since ACE-Zero does not estimate it and video metadata does not carry it.
+        logger.info(f"Writing COLMAP output (PINHOLE f={self.focal_length:.2f}px, "
+                    f"{self.image_width}x{self.image_height})...")
         with open(self.sparse_dir / "cameras.bin", "wb") as f:
             f.write(struct.pack("<QIiQQdddd", 1, 1, 1, self.image_width, self.image_height, self.focal_length, self.focal_length, self.image_width/2, self.image_height/2))
         with open(self.sparse_dir / "images.bin", "wb") as f:

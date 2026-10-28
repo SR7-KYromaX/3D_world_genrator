@@ -74,7 +74,8 @@ if __name__ == '__main__':
     parser.add_argument('--refine_calibration', type=_strtobool, default=True,
                         help="Optimize focal length during mapping.")
     parser.add_argument('--use_external_focal_length', type=float, default=-1,
-                        help="Provide the focal length. -1: Use 70%% of image diagonal.")
+                        help="Initial focal length hint (px), refined when refine_calibration is set. "
+                             "-1: 70 degree FOV (long side) heuristic.")
 
     # === ACE training parameters ===
     parser.add_argument('--image_resolution', type=int, default=480,
@@ -143,6 +144,8 @@ if __name__ == '__main__':
     parser.add_argument('--dense_point_cloud', type=_strtobool, default=False)
 
     parser.add_argument('--random_seed', type=int, default=1305)
+    parser.add_argument('--deterministic', type=_strtobool, default=False,
+                        help='train the map with deterministic cuDNN/kernels (train_ace.py)')
 
     opt = parser.parse_args()
 
@@ -166,7 +169,8 @@ if __name__ == '__main__':
 
     init_pose_file = opt.results_folder / "poses_init.txt"
 
-    # Use the focal length hint if provided, otherwise -1 triggers the 70% diagonal heuristic
+    # Use the focal length hint if provided (the pipeline passes video metadata or its 70-deg
+    # FOV guess), otherwise -1 makes init_all_poses apply that same 70-deg FOV heuristic
     init_focal = opt.use_external_focal_length if opt.use_external_focal_length > 0 else -1
 
     init_cmd = [
@@ -238,6 +242,7 @@ if __name__ == '__main__':
         "--render_flipped_portrait", str(opt.render_flipped_portrait),
         "--iterations_output", str(opt.iterations_output),
         "--render_depth_hist", str(opt.render_depth_hist),
+        "--deterministic", str(opt.deterministic),
     ]
 
     # Loss structure

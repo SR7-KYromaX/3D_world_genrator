@@ -1,0 +1,185 @@
+"""Client for the ACE localization sidecar (scripts/acezero/stream_sidecar.py).
+
+The sidecar runs in the ACE-Zero env; this side spawns it and exchanges Arrow IPC batches
+over its stdin/stdout. Events are delivered on a reader thread to ``on_event(kind, rows)``
+where rows are EVENT_SCHEMA dicts with w2c as a 4x4 array and points/pix as (N, 3)/(N, 2).
+
+Commands are queued and written by their own thread, so sending never blocks the caller.
+Handlers on the reader thread send commands (the first map localizes every pending frame),
+and pose events are ~30 KB each: if the reader blocked on a full stdin pipe while the
+sidecar blocked on a full stdout pipe that only the reader drains, both would hang.
+"""
+
+import logging
+import os
+import queue
+import signal
+import subprocess
+import threading
+from pathlib import Path
+from typing import Callable, Dict, Iterable, List, Optional
+
+import numpy as np
+
+from .schema import COMMAND_SCHEMA, IpcWriter, command_batch, ipc_batches, parse_meta
+
+logger = logging.getLogger(__name__)
+
+ACEZERO_ROOT = Path(__file__).resolve().parents[2] / "scripts" / "acezero"
+SIDECAR_SCRIPT = ACEZERO_ROOT / "stream_sidecar.py"
+
+
+def decode_event_rows(batch) -> List[Dict]:
+    rows = batch.to_pylist()
+    for r in rows:
+        r["w2c"] = np.asarray(r["w2c"], dtype=np.float64).reshape(4, 4) if r["w2c"] is not None else None
+        r["points"] = np.asarray(r["points"] or [], dtype=np.float32).reshape(-1, 3)
+        r["pix"] = np.asarray(r["pix"] or [], dtype=np.float32).reshape(-1, 2)
+        r["meta"] = parse_meta(r["meta"])
+    return rows
+
+
+class AceSidecar:
+    def __init__(self, work_dir: Path, on_event: Callable[[str, List[Dict]], None],
+                 hypotheses: int = 64, threshold: float = 10.0, max_points: int = 1500,
+                 python: Optional[str] = None, env: Optional[Dict[str, str]] = None):
+        from hypersplat.pipeline.wrappers.perception import acezero_python_env
+
+        default_python, default_env = acezero_python_env(ACEZERO_ROOT)
+        # The trainer's allocator options (e.g. expandable_segments) are for its torch; the ACE
+        # env runs torch 2.0, which rejects unknown options and would crash on start
+        default_env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+        # Under CUDA MPS (demo --mps) the sidecar is a client with its own SM / memory caps
+        if os.environ.get("HYPERSPLAT_SIDECAR_MPS_PCT"):
+            default_env["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = os.environ["HYPERSPLAT_SIDECAR_MPS_PCT"]
+        if os.environ.get("HYPERSPLAT_SIDECAR_MPS_MEM"):
+            default_env["CUDA_MPS_PINNED_DEVICE_MEM_LIMIT"] = os.environ["HYPERSPLAT_SIDECAR_MPS_MEM"]
+        cmd = [python or default_python, "-u", str(SIDECAR_SCRIPT), "--work_dir", str(work_dir),
+               "--hypotheses", str(hypotheses), "--threshold", str(threshold),
+               "--max_points", str(max_points)]
+        # stderr is inherited: ACE progress shows up in the trainer's log
+        # Own session: close() can take down the sidecar together with a running ACE job
+        self.proc = subprocess.Popen(cmd, cwd=str(ACEZERO_ROOT), stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, env=env or default_env,
+                                     start_new_session=True)
+        self.on_event = on_event
+        self._writer = IpcWriter(self.proc.stdin, COMMAND_SCHEMA)
+        self._outbox: "queue.Queue" = queue.Queue()  # command batches; None ends the writer
+        self.ready = threading.Event()
+        self._reader = threading.Thread(target=self._read, name="ace-sidecar-reader", daemon=True)
+        self._reader.start()
+        self._writer_thread = threading.Thread(target=self._write, name="ace-sidecar-writer", daemon=True)
+        self._writer_thread.start()
+
+    def _read(self):
+        try:
+            for batch in ipc_batches(self.proc.stdout):
+                rows = decode_event_rows(batch)
+                if not rows:
+                    continue
+                kind = rows[0]["kind"]
+                if kind == "ready":
+                    self.ready.set()
+                    continue
+                try:
+                    self.on_event(kind, rows)
+                except Exception:
+                    logger.exception("sidecar event handler failed")
+        except Exception as e:  # pipe torn down (shutdown or crash)
+            if self.proc.poll() is None:
+                logger.warning(f"[Stream] sidecar stream closed: {e}")
+        finally:
+            self.ready.set()
+            self.on_event("exit", [{"kind": "exit", "meta": {"returncode": self.proc.poll()}}])
+
+    def _write(self):
+        while True:
+            batch = self._outbox.get()
+            if batch is None:
+                return
+            try:
+                self._writer.write(batch)
+            except Exception as e:  # pipe torn down: the reader reports the exit
+                if self.proc.poll() is None:
+                    logger.warning(f"[Stream] sidecar command stream closed: {e}")
+                return
+
+    @property
+    def alive(self) -> bool:
+        return self.proc.poll() is None
+
+    def _send(self, cmd: str, frames: Iterable[str] = (), args: Iterable[str] = (), **params):
+        if not self.alive:
+            raise RuntimeError(f"ACE sidecar exited with code {self.proc.returncode}")
+        self._outbox.put(command_batch(cmd, frames, args, **params))
+
+    def bootstrap(self, frames: List[str], args: List[str], focal: float = -1.0, cache_dir: str = ""):
+        self._send("bootstrap", frames, args, focal=focal, cache_dir=cache_dir)
+
+    def localize(self, frame: str):
+        self._send("localize", [frame])
+
+    def refit(self, frames: List[str], iterations: int, conf_threshold: float, args: List[str]):
+        self._send("refit", frames, args, iterations=iterations, conf_threshold=conf_threshold)
+
+    def load(self, head: str, pose_file: str, frames: List[str], image_resolution: int = 480):
+        self._send("load", frames, head=head, pose_file=pose_file, image_resolution=image_resolution)
+
+    def seed(self, frame: str, depth: str, **params):
+        """Cold start: ACE-Zero's seed stage on one frame (identity pose, targets from the
+        depth map ``depth``, .npy camera z), then continuous mapping (stream_sidecar.py)."""
+        self._send("seed", [frame], depth=depth, **params)
+
+    def mapper(self, frames: List[str], **params):
+        """Switch the sidecar to continuous mapping (scripts/acezero/stream_mapper.py)."""
+        self._send("mapper", frames, **params)
+
+    def depth(self, frame: str, depth: str, depth_frac: float = 1.0, depth_weight: float = 50.0):
+        """Attach the aligned depth map (.npy, camera z in ACE units) of a registered frame to
+        the continuous mapper's loss (depth targets lifted by the frame's current pose)."""
+        self._send("depth", [frame], depth=depth, depth_frac=float(depth_frac),
+                   depth_weight=float(depth_weight))
+
+    def tick(self, n: int = 1):
+        self._send("tick", n=n)
+
+    def profile(self, units: int, out_dir: str):
+        """CUDA-profile the next ``units`` mapper units (hypersplat/stream/profiling.py)."""
+        self._send("profile", units=int(units), out=str(out_dir))
+
+    def rings(self, **paths: str):
+        """Pose / reloc rows go through these shared-memory rings from now on (ring.py)."""
+        self._send("rings", **paths)
+
+    def forget(self, frames: List[str]):
+        if frames:
+            self._send("forget", frames)
+
+    def close(self, timeout: float = 8.0):
+        if self.alive:
+            try:
+                self._send("shutdown")  # the sidecar terminates a running ACE job itself
+                self._outbox.put(None)
+                self._writer_thread.join(timeout)
+                if self._writer_thread.is_alive():
+                    # The sidecar stopped reading commands and the pipe is full: closing the
+                    # stream would write into it and block forever. Kill it instead (below),
+                    # which also breaks the writer thread's blocked write.
+                    raise TimeoutError("sidecar not reading commands")
+                self._writer.close()
+                self.proc.stdin.close()
+                self.proc.wait(timeout)
+            except Exception:
+                pass
+        # Sweep the sidecar's session: a stuck sidecar or an ACE job that outlived it
+        try:
+            os.killpg(self.proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            self.proc.wait(timeout)
+        except subprocess.TimeoutExpired:
+            pass
+        # With the sidecar gone its stdin pipe is broken: a writer blocked on it fails and exits.
+        # Let it finish before interpreter shutdown (a thread stuck in pyarrow then aborts Python)
+        self._writer_thread.join(timeout)

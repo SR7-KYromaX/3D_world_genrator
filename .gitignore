@@ -138,3 +138,28 @@ results
 # Run outputs & logs
 demo/output/
 pipeline_log.txt
+# Local env, capture media and A/B logs
+.venv_3dgrut/
+demo/input/
+experiments/*.log
+experiments/.gpu.lock
+experiments/map_cache/
+
+# Generated experiment data, recordings and point clouds stay local (A/B specs
+# experiments/*.json and scripts are tracked)
+experiments/*.out
+experiments/results/
+experiments/refit_bench/
+experiments/cuda_baseline/
+experiments/recordings/
+*.arrows
+*.ply
+*.splat
+*.npy
+*.npz
+!assets/test_garden.npz
+# Pipeline / stream run outputs wherever --output points (code-generated JSON too)
+acezero_output/
+stream_demo/
+scene_profile.json
+*.jsonl
