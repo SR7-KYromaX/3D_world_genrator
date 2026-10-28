@@ -53,6 +53,7 @@ from trainer_schedule import (
     floater_prune_mask,
     resolve_trainer_schedule,
 )
+from vjepa_checkpoint import default_vjepa_checkpoint, missing_vjepa_checkpoint
 
 from gsplat import export_splats
 from gsplat.compression import PngCompression
@@ -309,16 +310,17 @@ class Config:
     # "vjepa" (default): V-JEPA 2 is the main model; the depth/DINO stream is supporting context hooked
     # into its predictor. "feature": plain cosine on frozen DINO / Depth Anything features (baseline).
     latent_model: Literal["feature", "vjepa"] = "vjepa"
-    # V-JEPA 2 ViT-L checkpoint (vitl.pt: target_encoder + predictor), required for latent_model="vjepa"
-    vjepa_checkpoint: Optional[str] = "/mnt/Shared/3D_WORLD_GENRATION/hf_cache/vjepa2/vitl.pt"
+    # V-JEPA 2 ViT-L checkpoint (vitl.pt: target_encoder + predictor), required for latent_model="vjepa".
+    # Default: $HYPERSPLAT_VJEPA_CKPT, else the shared hf_cache copy
+    vjepa_checkpoint: Optional[str] = field(default_factory=default_vjepa_checkpoint)
     # Long side (px) of the photo / render fed to V-JEPA; multiple of 16
     vjepa_side: int = 256
     # Fraction of V-JEPA patches predicted (the rest are the visible context)
     vjepa_target_frac: float = 0.5
     # Learning rate of the secondary-token projection inside the predictor hook
     vjepa_hook_lr: float = 1e-3
-    # V-JEPA may add this fraction of the trainer's average step time; it runs every k-th step to stay
-    # within it, with the term scaled by k. 0 runs it every step.
+    # V-JEPA steps may add this fraction of the step time without it (whole step, backward included); it
+    # runs every k-th step to stay within it, with the term scaled by the actual gap. 0 runs it every step.
     vjepa_pace_budget: float = 0.5
     # Feed the render's alpha (3DGUT coverage, pooled per patch) to the predictor with the secondary stream
     vjepa_alpha_condition: bool = True
@@ -2780,9 +2782,8 @@ class Runner:
                             self._vjepa = self._build_vjepa(device)
                         latent_loss_val = None
                         self._vjepa_alpha_log = None
-                        if self._pacer.should_run(step):
-                            k = self._pacer.interval()
-                            t0 = time.time()
+                        k = self._pacer.take()  # 0 = skip; else steps since the last run
+                        if k > 0:
                             use_alpha = cfg.vjepa_alpha_condition or cfg.vjepa_alpha_lambda > 0
                             vout = self._vjepa(
                                 colors.permute(0, 3, 1, 2).clamp(0, 1), pixels.permute(0, 3, 1, 2),
@@ -2796,9 +2797,6 @@ class Runner:
                             if vout.alpha_hole is not None and cfg.vjepa_alpha_lambda > 0:
                                 loss = loss + cfg.vjepa_alpha_lambda * vout.alpha_hole * view_weight * k
                             self._vjepa_alpha_log = (vout.alpha_hole, vout.hole_frac)
-                            if str(device).startswith("cuda"):
-                                torch.cuda.synchronize(device)
-                            self._pacer.record(time.time() - t0)
                             # run steps carry k steps' worth of the term, so the expected gradient is unchanged
                             loss = loss + lam * latent_loss_val * view_weight * k
                     else:
@@ -2928,6 +2926,10 @@ class Runner:
                         latent_lambda(step, cfg.latent_lambda, cfg.latent_warmup_steps, cfg.latent_anneal_end),
                         step,
                     )
+                if cfg.latent_loss and cfg.latent_model == "vjepa":
+                    self.writer.add_scalar("train/vjepa_interval", self._pacer.interval(), step)
+                    if self._pacer.cost_s is not None:  # needs timed steps with and without V-JEPA
+                        self.writer.add_scalar("train/vjepa_cost_ms", self._pacer.cost_s * 1000.0, step)
                 if cfg.use_bilateral_grid:
                     self.writer.add_scalar("train/tvloss", tvloss.item(), step)
                 if cfg.tb_save_image:
@@ -3897,4 +3899,10 @@ if __name__ == "__main__":
         cfg.with_ut = False
         cfg.with_eval3d = False
 
+    # Fail at startup, not at torch.load once the stream is running. Before cli(): no CUDA init or
+    # worker spawn. Eval / render runs (--ckpt) never build V-JEPA, so they skip the check.
+    if cfg.ckpt is None:
+        msg = missing_vjepa_checkpoint(cfg.latent_loss, cfg.latent_model, cfg.vjepa_checkpoint)
+        if msg is not None:
+            sys.exit(msg)
     cli(main, cfg, verbose=True)
