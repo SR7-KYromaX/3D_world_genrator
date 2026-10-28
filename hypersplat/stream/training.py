@@ -8,6 +8,7 @@
     StreamViewAdjust per-keyframe pose deltas + exposure (gain/bias) for a changing image set
 """
 
+import logging
 import math
 import queue
 import threading
@@ -21,6 +22,8 @@ from .native import weighted_pick
 from .schema import select_rows
 from .source import decode_jpeg
 from .store import PseudoView
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================ parser stand-in
@@ -295,10 +298,18 @@ class StreamTrainSet(torch.utils.data.IterableDataset):
             self._version = version
 
     def sample(self) -> Dict:
+        t0 = last_warn = time.time()
         while True:
             self._refresh()
             if self._table is not None and self._table.num_rows:
                 break
+            failed = getattr(self.session, "failed", None)
+            if failed:
+                raise RuntimeError(f"[Stream] no training views and the session failed: {failed}")
+            if time.time() - last_warn >= 30.0:
+                last_warn = time.time()
+                logger.warning(f"[Stream] no registered training views for {last_warn - t0:.0f} s "
+                               f"(stats: {_view_stats(self.session)}); waiting for ACE")
             time.sleep(0.05)
         w = self.hardness() / np.sqrt(1.0 + self._drawn)
         if self.tier_weight:
@@ -322,20 +333,44 @@ class StreamTrainSet(torch.utils.data.IterableDataset):
 
         def fill():
             while not stop.is_set():
-                item = self.sample()
+                try:
+                    item = self.sample()
+                except BaseException as e:   # hand it to the trainer: a dead filler would hang q.get()
+                    item = _PrefetchError(e)
                 while not stop.is_set():
                     try:
                         q.put(item, timeout=0.5)
                         break
                     except queue.Full:
                         pass
+                if isinstance(item, _PrefetchError):
+                    return
 
         threading.Thread(target=fill, name="stream-prefetch", daemon=True).start()
         try:
             while True:
-                yield q.get()
+                item = q.get()
+                if isinstance(item, _PrefetchError):
+                    raise item.error
+                yield item
         finally:
             stop.set()
+
+
+class _PrefetchError:
+    """An exception from the prefetch thread, re-raised on the trainer's thread."""
+
+    def __init__(self, error: BaseException):
+        self.error = error
+
+
+def _view_stats(session) -> str:
+    try:
+        st = session.stats()
+        return ", ".join(f"{k} {st.get(k)}" for k in ("keyframes", "registered", "pending", "unregistered",
+                                                         "evicted", "job"))
+    except Exception:
+        return "unavailable"
 
 
 class StreamValSet(torch.utils.data.Dataset):

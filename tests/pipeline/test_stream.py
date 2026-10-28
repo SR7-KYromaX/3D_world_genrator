@@ -132,8 +132,31 @@ def test_store_eviction_order_and_pinning():
     assert a.kid in [k.kid for k in st.frames()] and d.kid in [k.kid for k in st.frames()]
 
 
+def test_store_keeps_map_anchors_through_a_keyframe_flood():
+    # A flood of keyframes outrunning localization (pending, not yet stale) used to evict the
+    # registered frames first; with 0 registered no refit could start and training never began
+    st = KeyframeStore(max_keyframes=30, protect_recent=4, pending_ttl=1e9, conf_threshold=100,
+                       min_registered=8)
+    for i in range(8):   # the bootstrap map's anchors
+        kf = st.add(b"r", 1, 1, float(i))
+        st.update_pose(kf.kid, np.linalg.inv(_cam(i * 10.0, i * 1.0)), 1000.0, 1)
+    st.map_ready_at = time.time()
+    for i in range(100):  # pending frames waiting for a pose
+        st.add(b"p", 1, 1, 100.0 + i)
+        st.evict_if_needed()
+    assert len(st.registered()) == 8 and len(st) == 30
+    assert all(kf.w2c is None for kf in st.frames()[8:])          # the oldest pending went instead
+    # Registered beyond the floor are evictable again (most redundant first)
+    for i in range(30):
+        kf = st.add(b"r", 1, 1, 300.0 + i)
+        st.update_pose(kf.kid, np.linalg.inv(_cam(500.0 + i * 10.0, i * 1.0)), 1000.0, 1)
+        st.evict_if_needed()
+    assert len(st) == 30 and len(st.registered()) >= 8
+
+
 def test_store_budget_bytes():
-    st = KeyframeStore(budget_mb=3000 / 2 ** 20, max_keyframes=100, protect_recent=0, conf_threshold=0)
+    st = KeyframeStore(budget_mb=3000 / 2 ** 20, max_keyframes=100, protect_recent=0, conf_threshold=0,
+                       min_registered=0)
     for i in range(5):
         kf = st.add(b"z" * 1000, 1, 1, i)
         st.update_pose(kf.kid, np.linalg.inv(_cam(i * 5.0, i * 0.1)), 1.0, 1)
@@ -168,6 +191,30 @@ def test_keyframe_gate_novelty_and_blur():
     blurred = cv2.GaussianBlur(_texture(99), (31, 31), 12)
     assert g.offer(blurred, 9.0).reason == "blurry"
     assert g.avg_motion is not None and g.avg_motion > 8.0
+
+
+def test_keyframe_gate_ignores_exposure_and_local_motion():
+    base = _texture(5)
+    # Auto exposure: the whole frame brighter (some highlights clip) or darker, same view
+    exposed = np.clip(base.astype(np.float32) * 1.25 + 10, 0, 255).astype(np.uint8)
+    darker = (base.astype(np.float32) * 0.75).astype(np.uint8)
+    # A person walking through: one region changes, the camera does not move
+    person = base.copy()
+    h, w = base.shape[:2]
+    person[h // 3:, : w // 4] = _texture(77)[h // 3:, : w // 4]
+    # Camera motion: the whole view shifts
+    moved = np.roll(base, w // 6, axis=1)
+
+    legacy = KeyframeGate(min_motion=8.0, max_interval=None, exposure_invariant=False, cells=None)
+    legacy.offer(base, 0.0)
+    assert legacy.offer(exposed, 0.1).accept                 # the noise the new gate removes
+
+    g = KeyframeGate(min_motion=8.0, max_interval=None)
+    assert g.offer(base, 0.0).accept
+    assert g.offer(exposed, 0.1).reason == "redundant"
+    assert g.offer(darker, 0.15).reason == "redundant"
+    assert g.offer(person, 0.2).reason == "redundant"
+    assert g.offer(moved, 0.3).accept
 
 
 def test_keyframe_gate_interval():
@@ -785,14 +832,32 @@ def test_android_spec_and_server_args():
     from hypersplat.stream.source import parse_source
 
     assert parse_source("android://") == ("android", "android://")
-    assert parse_android_spec("android://") == {"serial": None, "camera": "back", "max_size": 1920, "fps": 30}
+    assert parse_android_spec("android://") == {"serial": None, "camera": "back", "max_size": 1920, "fps": 30,
+                                                "bitrate": None}
     o = parse_android_spec("android://10BD?camera=front&max_size=1280&fps=24")
-    assert o == {"serial": "10BD", "camera": "front", "max_size": 1280, "fps": 24}
+    assert o == {"serial": "10BD", "camera": "front", "max_size": 1280, "fps": 24, "bitrate": None}
     args = server_args("4.1", "0badc0de", "back", 1920, 30)
     assert args[0] == "4.1"  # the server refuses a client of another version
     for kv in ("scid=0badc0de", "tunnel_forward=true", "video_source=camera", "camera_facing=back",
                "raw_stream=true", "audio=false", "control=false", "video_codec=h264"):
         assert kv in args
+    assert not any(a.startswith("video_bit_rate=") for a in args)
+
+
+def test_android_over_wifi_spec():
+    import pytest as _pytest
+
+    from hypersplat.stream.android import (_bit_rate, is_network_serial, parse_android_spec,
+                                           server_args)
+
+    o = parse_android_spec("android://192.168.1.23:5555?camera=back&bitrate=6M")
+    assert o["serial"] == "192.168.1.23:5555" and o["bitrate"] == "6M"
+    assert is_network_serial(o["serial"]) and is_network_serial("phone.lan:37123")
+    assert not is_network_serial("LRFYSS6T9LGYSSFE") and not is_network_serial(None)
+    assert "video_bit_rate=6000000" in server_args("4.1", "ab", "back", 1920, 30, "6M")
+    assert _bit_rate("800K") == 800_000 and _bit_rate("2500000") == 2_500_000
+    with _pytest.raises(ValueError):
+        _bit_rate("fast")
 
 
 def test_gpu_lease_defers_refit_until_difix_releases(session):
@@ -881,3 +946,52 @@ def test_hard_view_sampling_prefers_underfit_views():
     assert h[3] == 1.0  # pseudo views stay neutral
     ts.report_loss([3], [0.02])  # EMA, not last value
     assert 0.02 < ts.loss_ema[3] < 0.16
+
+
+
+@pytest.mark.parametrize("prefetch", [0, 2])
+def test_sampler_raises_when_session_fails_without_views(prefetch):
+    # Training used to wait forever at step 0 once no keyframe could register again
+    import threading as _threading
+
+    from hypersplat.stream.schema import VIEW_SCHEMA
+    from hypersplat.stream.training import StreamTrainSet
+
+    class NoViews:
+        failed = None
+
+        def views(self):
+            return 1, VIEW_SCHEMA.empty_table()
+
+        def stats(self):
+            return {"registered": 0}
+
+    session = NoViews()
+    _threading.Timer(0.2, lambda: setattr(session, "failed", "mapping stalled")).start()
+    ts = StreamTrainSet(session, prefetch=prefetch)
+    t0 = time.time()
+    with pytest.raises(RuntimeError, match="mapping stalled"):
+        next(iter(ts))
+    assert time.time() - t0 < 5
+
+
+
+def test_blocked_mapping_fails_session_once_nothing_can_register():
+    import threading as _threading
+    import types
+
+    from hypersplat.stream.session import StreamSession
+
+    st = KeyframeStore(conf_threshold=100)
+    pending = st.add(b"p", 1, 1, 0.0)
+    s = types.SimpleNamespace(store=st, source_ended=False, failed=None, _blocked_warned=False,
+                              _cond=_threading.Condition())
+    with s._cond:
+        StreamSession._mapping_blocked(s)          # live source: warn only
+        assert s._blocked_warned and s.failed is None
+        s.source_ended = True
+        StreamSession._mapping_blocked(s)          # a frame still waits for a pose
+        assert s.failed is None
+        st.update_pose(pending.kid, np.eye(4), 1.0, 1)   # it failed to register
+        StreamSession._mapping_blocked(s)
+        assert s.failed and "mapping stalled" in s.failed

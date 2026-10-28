@@ -229,6 +229,15 @@ class WalkBoundsPublisher:
             self.enabled = bool(self._toggle.value)
             self._broadcast()
 
+        self._home = server.gui.add_button(
+            "Go to start view", hint="Jump to the first registered camera, levelled, "
+                                     "looking where it looked (a view that matches a photo).")
+
+        @self._home.on_click
+        def _(event) -> None:
+            if self.bounds is not None and event.client is not None:
+                self._place(event.client, self.bounds)
+
         server.on_client_connect(self._on_connect)
 
     @property
@@ -263,7 +272,21 @@ class WalkBoundsPublisher:
             ic.up = (0.0, 0.0, 1.0)
             ic.position = b.start_position
             ic.look_at = b.start_look_at
+            # initial_camera only reaches clients that connect later: the browser opened at
+            # launch (before the first map) would stay at viser's default, out in empty space
+            for client in self.server.get_clients().values():
+                self._place(client, b)
         self._broadcast()
+
+    @staticmethod
+    def _place(client, b: WalkBounds) -> None:
+        try:
+            with client.atomic():
+                client.camera.up_direction = (0.0, 0.0, 1.0)
+                client.camera.position = b.start_position
+                client.camera.look_at = b.start_look_at
+        except Exception as e:   # the viewer must never take training down
+            logger.warning(f"Walk mode: could not move a viewer to the start view: {e}")
 
     def _message(self):
         b = self.bounds

@@ -75,3 +75,86 @@ def test_pseudo_share_cap_keeps_real_views_dominant():
     assert np.allclose(ts._cap_pseudo(w), w)
     ts.pseudo_share, ts._pseudo = None, [False] * 4 + [True] * 4  # no cap configured
     assert np.allclose(ts._cap_pseudo(w), w)
+
+
+def test_preload_must_finish_before_modules_are_created(monkeypatch):
+    # The Hugging Face load swaps nn.Module.register_parameter process-wide
+    # (accelerate.init_empty_weights): a parameter registered on another thread meanwhile
+    # lands on the meta device. wait_preload() is the barrier the trainer relies on.
+    import threading
+    import time
+
+    import torch
+    accelerate = pytest.importorskip("accelerate")
+
+    inside = threading.Event()
+
+    def slow_build(device):
+        with accelerate.init_empty_weights():
+            inside.set()
+            time.sleep(0.5)
+        return object()
+
+    d = _difix()
+    monkeypatch.setattr(d, "_build_fixer", slow_build)
+    d.preload()
+    inside.wait(5)
+    raced = torch.nn.ParameterDict({"means": torch.nn.Parameter(torch.zeros(4, 3))})
+    assert raced["means"].device.type == "meta"   # the race the trainer used to hit
+    d.wait_preload()
+    assert d.fixer is not None and d._preload is None
+    safe = torch.nn.ParameterDict({"means": torch.nn.Parameter(torch.zeros(4, 3))})
+    assert safe["means"].device.type == "cpu"
+
+
+def test_failed_preload_is_cleared_by_wait(monkeypatch):
+    d = _difix()
+
+    def boom(device):
+        raise RuntimeError("no network")
+
+    monkeypatch.setattr(d, "_build_fixer", boom)
+    d.preload()
+    d.wait_preload()
+    assert d.fixer is None and d._preload is None and d._preload_error is None
+    d.wait_preload()   # idempotent
+
+
+
+def test_round_starts_pseudo_views_from_depth_warped_photos(monkeypatch):
+    import time
+
+    import numpy as np
+
+    from hypersplat.stream.difix_online import DifixSources
+
+    H, W = 40, 60
+    K = np.array([[50.0, 0, W / 2], [0, 50.0, H / 2], [0, 0, 1]])
+    photo = (np.random.default_rng(0).random((H, W, 3)) * 255).astype(np.uint8)
+    moved = np.eye(4)
+    moved[0, 3] = 0.08                                   # 2 px of disparity at z = 2
+    src = DifixSources(c2ws=np.stack([np.eye(4), np.eye(4)]), K=K, width=W, height=H,
+                       weights=np.ones(2), points=np.zeros((1, 3)), get_image=lambda i: photo,
+                       ids=[10, 11], get_depth=lambda i: np.full((H // 2, W // 2), 2.0) if i == 0 else None)
+    d = OnlineDifix(profile=SceneProfile(), device="cpu", model_id="nvidia/difix_ref")
+    monkeypatch.setattr(d, "_fixer_on_gpu", lambda: (lambda img, ref, scale, seed: img))
+    monkeypatch.setattr(d, "_park", lambda: None)
+    d._round = {"src": src, "poses": [(0, moved, 1.0), (1, moved, 1.0)], "angle": 2.0, "base_weight": 1.0,
+                "renders": [], "fixed": [], "t0": time.time(), "step0": 0, "chunks": 0, "max_chunk_s": 0.0,
+                "t": {"render_ms": 0.0, "difix_ms": 0.0, "load_ms": 0.0, "park_ms": 0.0, "warp_ms": 0.0},
+                "warp_cover": []}
+    gray = np.full((H, W, 3), 77, np.uint8)
+    assert d.step_round(lambda c2w, K, w, h: gray, budget_s=None)
+    warped, plain = d._round["renders"]
+    np.testing.assert_array_equal(warped[:, 3:-3], photo[:, 5:-1])   # the real photo, shifted
+    assert (warped[:, -1] == 77).all()                               # the hole: the splat render
+    assert (plain == 77).all()                                       # no depth: render only
+    assert d._round["warp_cover"] == [pytest.approx(1 - 1 / W)]
+    round_state = dict(d._round)
+    _, _, stats = d.finish_round(step=100)
+    assert stats["warped_views"] == 1 and stats["warp_cover"] == pytest.approx(1 - 1 / W, abs=1e-3)
+    d._round = round_state
+    d.depth_warp = False
+    d._round.update(renders=[], fixed=[])
+    d.step_round(lambda c2w, K, w, h: gray, budget_s=None)
+    assert (d._round["renders"][0] == 77).all()

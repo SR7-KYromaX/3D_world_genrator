@@ -12,6 +12,15 @@ Both routes use the USB-C cable (any USB-C / Thunderbolt port):
     python -m hypersplat.stream.phone detect    # JSON: {"mode", "device", "serial", "problems"}
     python -m hypersplat.stream.phone usb [back|front]
                                                 # JSON: external USB camera (or phone) for the demo
+
+Over Wi-Fi (the android route through adb's TCP transport; phone and computer on one network):
+
+    python -m hypersplat.stream.phone wifi [SERIAL]
+            # cable plugged in once: adb tcpip 5555 + adb connect; JSON {"address"}. Unplug
+            # after; it lasts until the phone reboots
+    python -m hypersplat.stream.phone pair HOST:PORT CODE
+            # Android 11+, no cable: Developer options > Wireless debugging > Pair device with
+            # pairing code; then use the IP:PORT that screen shows for connecting
 """
 
 import json
@@ -152,9 +161,33 @@ def detect(sysfs: Path = Path("/sys/class/video4linux")) -> Dict:
 
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
-    if cmd not in ("detect", "usb"):
+    if cmd not in ("detect", "usb", "wifi", "pair"):
         print(__doc__)
         sys.exit(2)
+    if cmd in ("wifi", "pair"):
+        from . import android
+        try:
+            if cmd == "pair":
+                if len(sys.argv) < 4:
+                    raise RuntimeError("usage: pair HOST:PORT CODE")
+                print(json.dumps({"paired": android.adb_pair(sys.argv[2], sys.argv[3])}))
+                return
+            serial = sys.argv[2] if len(sys.argv) > 2 else None
+            if serial is None:
+                usb = [d["serial"] for d in android.adb_devices()
+                       if d["state"] == "device" and not android.is_network_serial(d["serial"])]
+                if not usb:
+                    raise RuntimeError("no phone on USB with debugging authorised (plug it in once)")
+                serial = usb[0]
+            address = android.enable_wifi(serial)
+            state = android.adb_connect(address)
+            if state != "device":
+                raise RuntimeError(f"adb connect {address}: {state} (same Wi-Fi network? firewall?)")
+            print(json.dumps({"address": address}))
+        except (RuntimeError, OSError) as e:
+            print(json.dumps({"error": str(e)}))
+            sys.exit(1)
+        return
     facing = sys.argv[2] if len(sys.argv) > 2 else "back"
     print(json.dumps(detect() if cmd == "detect" else detect_usb(facing=facing)))
 

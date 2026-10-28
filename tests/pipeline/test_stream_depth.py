@@ -3,6 +3,7 @@ disparity prediction to sparse ACE points, sharpening, flying-pixel masking, unp
 
 import cv2
 import numpy as np
+import pytest
 
 from hypersplat.stream.depth import (align_disparity, dense_depth, flying_pixel_mask,
                                      guided_filter, unproject)
@@ -127,13 +128,16 @@ def test_depth_preview_publishes_new_frames_only_and_stops():
     got = []
     prev = DepthPreview(FakeEstimator(), lambda: frame["item"], got.append, fps=50).start()
     _time.sleep(0.2)
-    assert FakeEstimator.calls == 1 and len(got) == 1          # same frame: not recomputed
-    frame["item"] = (np.full((60, 80, 3), 50, np.uint8), 0.1, False, 2)
+    assert FakeEstimator.calls == 0 and not got                # not a keyframe: skipped
+    frame["item"] = (np.zeros((60, 80, 3), np.uint8), 0.05, True, 2)
+    _time.sleep(0.2)
+    assert FakeEstimator.calls == 1 and len(got) == 1          # same keyframe: not recomputed
+    frame["item"] = (np.full((60, 80, 3), 50, np.uint8), 0.1, True, 3)
     _time.sleep(0.2)
     prev.stop()
     assert FakeEstimator.calls == 2 and prev.frames == 2
     n = FakeEstimator.calls
-    frame["item"] = (np.zeros((60, 80, 3), np.uint8), 0.2, False, 3)
+    frame["item"] = (np.zeros((60, 80, 3), np.uint8), 0.2, True, 4)
     _time.sleep(0.1)
     assert FakeEstimator.calls == n                              # stopped
 
@@ -266,3 +270,36 @@ def test_session_stores_feedback_weights_and_drops_evicted():
     s._depth_w[99] = np.ones((1, 1), np.float16)       # evicted keyframe
     s.set_depth(2, z.copy(), {"ms": 5.0}, disp=network_like(z), version=1)
     assert 99 not in s._depth_w and 1 in s._depth_w
+
+
+def test_continuous_depth_tick_one_keyframe_and_buffered_seeds():
+    # stream_depth_every: one backlog keyframe per tick (like ACE's continuous mapping), none
+    # while Difix holds the GPU or nothing is queued; seeds wait for the next sync
+    import sys
+    import types
+    from pathlib import Path
+
+    examples = str(Path(__file__).resolve().parents[2] / "examples")
+    if examples not in sys.path:
+        sys.path.insert(0, examples)
+    st = pytest.importorskip("simple_trainer")
+    calls = []
+
+    def fake_depth(self, step, n=None):
+        calls.append((step, n))
+        return np.full((5, 3), step, np.float32), np.zeros((5, 3), np.float32)
+
+    lease = types.SimpleNamespace(holder=None)
+    me = types.SimpleNamespace(_depth_seeds=[], stream=types.SimpleNamespace(depth_backlog=3, gpu_lease=lease))
+    me._stream_depth = types.MethodType(fake_depth, me)
+    st.Runner._depth_tick(me, 10)
+    st.Runner._depth_tick(me, 20)
+    lease.holder = "difix"
+    st.Runner._depth_tick(me, 30)
+    lease.holder = "ace"
+    me.stream.depth_backlog = 0
+    st.Runner._depth_tick(me, 40)
+    assert calls == [(10, 1), (20, 1)]
+    xyz, _ = st.Runner._take_depth_seeds(me)
+    assert xyz.shape == (10, 3) and me._depth_seeds == []
+    assert st.Runner._take_depth_seeds(me)[0].shape == (0, 3)

@@ -76,9 +76,13 @@ def _binary_chunk(buf: pa.Buffer) -> pa.Array:
 
 class KeyframeStore:
     def __init__(self, budget_mb: float = 256, max_keyframes: int = 400, test_every: int = 8,
-                 protect_recent: int = 8, pending_ttl: float = 30.0, conf_threshold: float = 500.0):
+                 protect_recent: int = 8, pending_ttl: float = 30.0, conf_threshold: float = 500.0,
+                 min_registered: int = 32):
         self.budget_bytes = int(budget_mb * 1024 * 1024)
         self.max_keyframes = max_keyframes
+        # Registered keyframes anchor the ACE map (a refit needs >= 3 of them): never evict
+        # below this many, and never while frames still waiting for a pose could go instead
+        self.min_registered = min(min_registered, max_keyframes)
         self.test_every = test_every
         self.protect_recent = protect_recent
         self.pending_ttl = pending_ttl
@@ -194,23 +198,31 @@ class KeyframeStore:
         if failed:
             return min(failed, key=lambda k: (k.conf, k.kid))
         registered = [k for k in frames if self.is_registered(k)]
-        cand_ids = {k.kid for k in candidates}
-        best, best_key = None, None
-        for split in ("train", "val"):
-            pool = [k for k in registered if k.split == split]
-            if len(pool) < 2:
-                continue
-            c2ws = np.linalg.inv(np.stack([k.w2c for k in pool]))
-            spacing = float(np.median(np.linalg.norm(np.diff(c2ws[:, :3, 3], axis=0), axis=1))) or 1.0
-            query = np.array([k.kid in cand_ids for k in pool], dtype=np.uint8)
-            nn = native.pose_nn_distance(c2ws, query, spacing, ANGLE_UNIT_DEG)  # C, O(N^2)
-            for k, d, q in zip(pool, nn, query):
-                if q and (best_key is None or (d, k.conf) < best_key):
-                    best, best_key = k, (d, k.conf)
-        if best is not None:
-            return best
-        # Nothing registered to compare: drop the oldest unprotected frame
-        return candidates[0]
+        spare = len(registered) > self.min_registered
+        if spare:
+            cand_ids = {k.kid for k in candidates}
+            best, best_key = None, None
+            for split in ("train", "val"):
+                pool = [k for k in registered if k.split == split]
+                if len(pool) < 2:
+                    continue
+                c2ws = np.linalg.inv(np.stack([k.w2c for k in pool]))
+                spacing = float(np.median(np.linalg.norm(np.diff(c2ws[:, :3, 3], axis=0), axis=1))) or 1.0
+                query = np.array([k.kid in cand_ids for k in pool], dtype=np.uint8)
+                nn = native.pose_nn_distance(c2ws, query, spacing, ANGLE_UNIT_DEG)  # C, O(N^2)
+                for k, d, q in zip(pool, nn, query):
+                    if q and (best_key is None or (d, k.conf) < best_key):
+                        best, best_key = k, (d, k.conf)
+            if best is not None:
+                return best
+        # The map's anchors stay: drop the oldest frame still waiting for a pose (a keyframe
+        # flood outrunning localization evicted every registered frame and stalled mapping)
+        pending = [k for k in candidates if k.w2c is None]
+        if pending:
+            return pending[0]
+        if spare:
+            return next((k for k in candidates if self.is_registered(k)), None)
+        return None   # over budget for now rather than below the anchor floor
 
     # ---------------------------------------------------------------- trainer snapshot
     def views(self, to_trainer: Callable[[np.ndarray], np.ndarray],

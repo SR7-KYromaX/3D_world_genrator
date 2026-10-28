@@ -52,19 +52,25 @@ class DifixSources:
     points: np.ndarray                        # (M, 3) scene points (look-at depth, spread)
     get_image: Callable[[int], np.ndarray]    # source index -> RGB uint8 (height, width, 3)
     ids: Sequence[int]                        # caller's id per source (train index / keyframe id)
+    # source index -> z-depth in this frame (any resolution, 0 = invalid) or None: pseudo views
+    # then start from the photo re-projected to the pseudo camera (hypersplat/stream/warp.py)
+    get_depth: Optional[Callable[[int], Optional[np.ndarray]]] = None
 
 
 class OnlineDifix:
     def __init__(self, model_id: str = "nvidia/difix_ref", device: str = "cuda", profile=None,
                  debug_dir: Optional[str] = None, seed: Optional[int] = 0, deterministic: bool = True,
-                 pool_views: int = 8):
+                 pool_views: int = 8, depth_warp: bool = True):
         """seed: base of a private per-view generator (None: torch's global RNG, which also
         shifts the trainer's MCMC / sampling stream by however many draws Difix made).
         deterministic: encode with the VAE posterior mean (no sampling noise at all).
         pool_views: judge hallucination / steer angle and weight on the change PSNRs of the
         last rounds holding at least this many views, not on one round alone. The stream cycle
         runs 2-view rounds: one bad pair stopped Difix for the rest of the run and the orbit
-        angle random-walked on 2-view means. 0 = per round (the batch loop's rule)."""
+        angle random-walked on 2-view means. 0 = per round (the batch loop's rule).
+        depth_warp: a pseudo view whose source has a depth map (DifixSources.get_depth) starts
+        from that real photo re-projected to the pseudo camera, the splat render only filling
+        what the photo never saw; Difix then cleans the seams and fills the holes."""
         from hypersplat.pipeline.params import SceneProfile
 
         self.model_id = model_id
@@ -74,6 +80,7 @@ class OnlineDifix:
         self.seed = seed
         self.deterministic = bool(deterministic)
         self.pool_views = int(pool_views)
+        self.depth_warp = bool(depth_warp)
         self._recent: List[Tuple[List[float], int, int, float]] = []  # (changes, kept, n, angle) per round
         self.fixer = None
         self.rounds = 0
@@ -102,7 +109,12 @@ class OnlineDifix:
 
     def preload(self):
         """Load the model into pinned host memory on a background thread, so the first round
-        only pays a host-to-device copy instead of a cold load from disk (~10 s)."""
+        only pays a host-to-device copy instead of a cold load from disk (~10 s).
+
+        The Hugging Face load patches torch process-wide while it builds the models
+        (accelerate's init_empty_weights swaps nn.Module.register_parameter so new parameters
+        land on the meta device): until wait_preload() returns, the caller must not create
+        modules / parameters or run another from_pretrained."""
         if self.fixer is not None or self._preload is not None:
             return
 
@@ -117,15 +129,21 @@ class OnlineDifix:
         self._preload = threading.Thread(target=run, name="difix-preload", daemon=True)
         self._preload.start()
 
+    def wait_preload(self):
+        """Join a preload() in flight (no-op otherwise); a failed preload is retried by the
+        first round."""
+        if self._preload is None:
+            return
+        self._preload.join()
+        self._preload = None
+        if self._preload_error is not None:
+            logger.warning(f"[Difix-online] preload failed ({self._preload_error}); loading at the first round")
+            self._preload_error = None
+
     def _fixer_on_gpu(self):
         import torch
 
-        if self._preload is not None:
-            self._preload.join()
-            self._preload = None
-            if self._preload_error is not None:
-                logger.warning(f"[Difix-online] preload failed ({self._preload_error}); loading now")
-                self._preload_error = None
+        self.wait_preload()
         torch.cuda.empty_cache()
         if self.fixer is None:
             self.fixer = self._build_fixer(self.device)
@@ -184,8 +202,9 @@ class OnlineDifix:
         poses = make_pseudo_poses(src.c2ws, src.weights, src.points, n_views, angle, seed=loop + 1)
         self._round = {"src": src, "poses": poses, "angle": angle, "base_weight": base_weight,
                        "renders": [], "fixed": [], "t0": time.time(), "step0": int(step),
-                       "t": {"render_ms": 0.0, "difix_ms": 0.0, "load_ms": 0.0, "park_ms": 0.0},
-                       "chunks": 0, "max_chunk_s": 0.0}
+                       "t": {"render_ms": 0.0, "difix_ms": 0.0, "load_ms": 0.0, "park_ms": 0.0,
+                             "warp_ms": 0.0},
+                       "chunks": 0, "max_chunk_s": 0.0, "warp_cover": []}
 
     def step_round(self, render_fn: Callable[[np.ndarray, np.ndarray, int, int], np.ndarray],
                    budget_s: Optional[float] = 3.0) -> bool:
@@ -214,6 +233,8 @@ class OnlineDifix:
                 render = render_fn(c2w, src.K, src.width, src.height)
                 r["t"]["render_ms"] += (time.time() - t) * 1000
                 ref = src.get_image(s) if use_ref else None
+                if self.depth_warp and src.get_depth is not None:
+                    render = self._warped_input(r, src, s, c2w, render, ref)
                 t = time.time()
                 while True:
                     try:
@@ -241,6 +262,23 @@ class OnlineDifix:
                 r["chunks"] += 1
                 r["max_chunk_s"] = max(r["max_chunk_s"], time.time() - t_chunk)
         return len(r["fixed"]) >= len(r["poses"])
+
+    def _warped_input(self, r: dict, src: DifixSources, s: int, c2w: np.ndarray,
+                      render: np.ndarray, photo: Optional[np.ndarray]) -> np.ndarray:
+        """Difix's input for one pseudo view: source photo re-projected by its depth, the splat
+        render where the photo has no pixel. The render alone when the source has no depth."""
+        from .warp import composite, warp_to_view
+
+        depth = src.get_depth(s)
+        if depth is None:
+            return render
+        t = time.time()
+        photo = src.get_image(s) if photo is None else photo
+        warped, valid = warp_to_view(photo, depth, src.K, np.asarray(src.c2ws[s], np.float64),
+                                     np.asarray(c2w, np.float64), device=self.device)
+        r["t"]["warp_ms"] += (time.time() - t) * 1000
+        r["warp_cover"].append(float(valid.mean()))
+        return composite(warped, valid, render)
 
     def finish_round(self, step: int) -> Tuple[List[PseudoView], List[int], dict]:
         """Weights + pseudo views of a fully fixed round (see run_round)."""
@@ -287,7 +325,10 @@ class OnlineDifix:
                       "max_chunk_s": round(r["max_chunk_s"], 2),
                       "render_ms_per_view": round(r["t"]["render_ms"] / n, 1),
                       "difix_ms_per_view": round(r["t"]["difix_ms"] / n, 1),
-                      "load_ms": round(r["t"]["load_ms"]), "park_ms": round(r["t"]["park_ms"])})
+                      "load_ms": round(r["t"]["load_ms"]), "park_ms": round(r["t"]["park_ms"]),
+                      "warped_views": len(r["warp_cover"]),
+                      "warp_cover": round(float(np.mean(r["warp_cover"])), 3) if r["warp_cover"] else None,
+                      "warp_ms_per_view": round(r["t"]["warp_ms"] / max(len(r["warp_cover"]), 1), 1)})
         self.profile.append("difix.rounds", stats, "difix.online")
         self.profile.save()
         self.rounds += 1
@@ -302,6 +343,9 @@ class OnlineDifix:
                     f"{stats['difix_ms_per_view']:.0f} ms/view Difix + {stats['render_ms_per_view']:.0f} ms render, "
                     f"{stats['chunks']} chunks (longest {stats['max_chunk_s']:.1f} s, load {stats['load_ms']} ms, "
                     f"park {stats['park_ms']} ms), {stats['wall_s']:.0f} s wall"
+                    + (f"; {stats['warped_views']} views from depth-warped photos "
+                       f"({stats['warp_cover']:.0%} real pixels, {stats['warp_ms_per_view']:.0f} ms/view)"
+                       if stats["warped_views"] else "")
                     + (f"; stopping: {reason}" if reason else ""))
         return views, sources, stats
 

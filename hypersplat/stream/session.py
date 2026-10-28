@@ -70,6 +70,7 @@ class StreamConfig:
     jpeg_quality: int = 90
     budget_mb: float = 384.0            # encoded keyframes + ACE copies + pseudo views
     max_keyframes: int = 1000           # keep most accepted keyframes (ACE buffer ~2.4 MB host RAM each)
+    min_registered: int = 32            # registered keyframes eviction never goes below (map anchors)
     capture_fps: Optional[float] = 60.0  # asked of local cameras (phones: android://...&fps=)
     # Per-source keyframe spacing (hypersplat/stream/spacing.py): measure the rotation between
     # adjacent accepted keyframes; off by default, status-only until a consumer uses eps
@@ -249,7 +250,8 @@ class StreamSession:
         self.kind = kind
         self.work_dir = Path(cfg.work_dir or f"/dev/shm/hypersplat-stream-{os.getpid()}")
         self.frames_dir = self.work_dir / "frames"
-        self.store = KeyframeStore(cfg.budget_mb, cfg.max_keyframes, cfg.test_every)
+        self.store = KeyframeStore(cfg.budget_mb, cfg.max_keyframes, cfg.test_every,
+                                   min_registered=cfg.min_registered)
         self.gate = KeyframeGate(min_motion=cfg.min_motion)
         self.spacing = SpacingTracker(min_inliers=cfg.spacing_min_inliers)
         # Previous keyframe's SIFT features and ACE-res (w, h): each keyframe is described once
@@ -266,6 +268,7 @@ class StreamSession:
         self._stop = threading.Event()
         self.map_ready = threading.Event()
         self.failed: Optional[str] = None
+        self._blocked_warned = False   # refit blocked (< 3 registered keyframes) logged once
         self.source_ended = False
         self.recording_stopped: Optional[str] = None   # why recording was stopped early
         self._record_since = time.time() - 1.0         # stale record_stop_file guard (mtime)
@@ -698,6 +701,7 @@ class StreamSession:
             return
         frames = [kf.ace_path for kf in self.store.frames() if kf.ace_path and kf.w2c is not None]
         if len(self.store.registered()) < 3:
+            self._mapping_blocked()
             return
         if not self.gpu_lease.try_acquire("ace"):
             # A Difix round holds the GPU; release_gpu() retries (the counters are kept)
@@ -730,6 +734,21 @@ class StreamSession:
         self._new_failed = self._new_registered = 0
         self._grow_pending = False
         self.sidecar.refit(frames, self.cfg.refit_iterations, self.store.conf_threshold, args)
+
+    def _mapping_blocked(self):
+        """A refit needs >= 3 registered keyframes to anchor the map. Caller holds _cond.
+        Warn once; once the source ended and no keyframe still waits for a pose nothing can
+        register again, so fail the session instead of leaving the trainer without views."""
+        n_reg = len(self.store.registered())
+        if not self._blocked_warned:
+            self._blocked_warned = True
+            logger.warning(f"[Stream] ACE refit blocked: {n_reg} registered keyframes (needs 3) "
+                           f"of {len(self.store)}; mapping resumes only if new frames localize")
+        if self.source_ended and not self.store.pending() and not self.failed:
+            self.failed = (f"mapping stalled: {n_reg} registered of {len(self.store)} keyframes "
+                           f"after the source ended (a refit needs 3)")
+            logger.error(f"[Stream] {self.failed}")
+            self._cond.notify_all()
 
     def _maybe_final_refit(self):
         with self._cond:

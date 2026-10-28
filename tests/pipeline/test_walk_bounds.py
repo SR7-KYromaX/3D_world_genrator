@@ -93,3 +93,63 @@ def test_npz_round_trip(tmp_path):
     np.testing.assert_array_equal(b2.mask, b.mask)
     np.testing.assert_allclose(b2.heights, b.heights)
     assert b2.start_look_at == pytest.approx(b.start_look_at)
+
+
+def test_clean_view_keeps_flat_surface_splats():
+    # Splats on a surface are flat discs (two long axes, one tiny): the old max/min needle
+    # test hid 100% of a phone model's visible splats; only max >> middle is a needle
+    import sys
+    import types
+    from pathlib import Path
+
+    import torch
+
+    examples = str(Path(__file__).resolve().parents[2] / "examples")
+    if examples not in sys.path:
+        sys.path.insert(0, examples)
+    st = pytest.importorskip("simple_trainer")
+    scales = torch.tensor([[0.3, 0.3, 0.001],     # flat disc on a surface: keep
+                           [0.6, 0.01, 0.01],     # needle: hide
+                           [0.3, 0.3, 0.001],     # faint: hide
+                           [2.0, 2.0, 2.0]])      # blob > 8 voxels: hide
+    opa = torch.tensor([0.9, 0.9, 0.005, 0.9])
+    cfg = types.SimpleNamespace(viewer_min_opacity=0.02, viewer_max_aniso=30.0, viewer_max_scale_voxels=8.0)
+    me = types.SimpleNamespace(cfg=cfg, stream_voxel=0.1,
+                               splats={"scales": scales.log(), "opacities": torch.logit(opa)})
+    assert st.Runner._viewer_keep(me).tolist() == [1.0, 0.0, 0.0, 0.0]
+    me.stream_voxel = None
+    assert st.Runner._viewer_keep(me).tolist() == [1.0, 0.0, 0.0, 1.0]
+
+
+def test_first_bounds_move_viewers_already_connected():
+    # viser's initial_camera only reaches clients that connect later; the browser opened at
+    # launch must be moved to the start view too
+    import contextlib
+    import threading
+    import types
+
+    from hypersplat.stream.walk_bounds import WalkBoundsPublisher
+
+    class Client:
+        def __init__(self):
+            self.camera = types.SimpleNamespace(position=None, look_at=None, up_direction=None)
+
+        @contextlib.contextmanager
+        def atomic(self):
+            yield
+
+    clients = {1: Client(), 2: Client()}
+    server = types.SimpleNamespace(initial_camera=types.SimpleNamespace(), get_clients=lambda: clients)
+    pub = WalkBoundsPublisher.__new__(WalkBoundsPublisher)
+    pub.server, pub.client_ok, pub._placed, pub.version, pub.bounds = server, False, False, 0, None
+    pub._lock = threading.Lock()
+    pub._info = types.SimpleNamespace(content="")
+    b = compute_walk_bounds(_poses(_line()), scene_scale=1.0)
+    pub.publish(b)
+    assert server.initial_camera.position == b.start_position
+    for c in clients.values():
+        assert c.camera.position == b.start_position and c.camera.look_at == b.start_look_at
+        assert c.camera.up_direction == (0.0, 0.0, 1.0)
+    clients[1].camera.position = (9.0, 9.0, 9.0)
+    pub.publish(b)                                   # later updates leave the user's view alone
+    assert clients[1].camera.position == (9.0, 9.0, 9.0)

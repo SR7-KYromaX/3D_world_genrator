@@ -2,6 +2,11 @@
 
     android://                    first adb device, back camera
     android://SERIAL?camera=front&max_size=1920&fps=30
+    android://192.168.1.23:5555   over Wi-Fi (adb wireless): connected with ``adb connect``
+                                  first, and again if the link drops. Set up once with the
+                                  cable (``adb tcpip``, see enable_wifi) or, on Android 11+,
+                                  by pairing from Developer options > Wireless debugging
+    ...&bitrate=6M                 video bit rate (scrcpy default 8M; lower it on weak Wi-Fi)
 
 Uses scrcpy's device-side server (the official static build ships it together with adb):
 adb pushes scrcpy-server to the phone, forwards a local TCP port to its socket, and starts it
@@ -69,6 +74,58 @@ def adb_devices(adb: Optional[str] = None) -> list:
 
 
 MIN_CAMERA_SDK = 31   # scrcpy camera capture needs Android 12 (API 31)
+WIFI_PORT = 5555
+
+
+def is_network_serial(serial: Optional[str]) -> bool:
+    """An adb-over-Wi-Fi device id (HOST:PORT) rather than a USB serial."""
+    return bool(serial) and re.fullmatch(r"[\w.\-]+:\d+", serial) is not None
+
+
+def adb_connect(address: str, adb: Optional[str] = None, timeout: float = 15.0) -> str:
+    """``adb connect HOST:PORT`` and wait for the device; returns its adb state (``device``
+    when ready, ``missing`` when the phone is unreachable)."""
+    adb = adb or adb_path()
+    if not adb:
+        return "missing"
+    try:
+        subprocess.run([adb, "connect", address], capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return "missing"
+    deadline = time.time() + timeout
+    state = "missing"
+    while time.time() < deadline:
+        state = next((d["state"] for d in adb_devices(adb) if d["serial"] == address), "missing")
+        if state == "device":
+            break
+        time.sleep(0.5)
+    return state
+
+
+def enable_wifi(serial: str, adb: Optional[str] = None, port: int = WIFI_PORT) -> str:
+    """Switch a USB-connected phone's adb to TCP (``adb tcpip``; lasts until it reboots) and
+    return its Wi-Fi address HOST:PORT. The phone and this machine must share a network."""
+    adb = adb or adb_path()
+    out = subprocess.run([adb, "-s", serial, "shell", "ip -f inet addr show wlan0"],
+                         capture_output=True, text=True, timeout=20).stdout
+    m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", out)
+    if not m:
+        raise RuntimeError("the phone has no Wi-Fi address (is Wi-Fi on and connected?)")
+    r = subprocess.run([adb, "-s", serial, "tcpip", str(port)], capture_output=True, text=True, timeout=20)
+    if r.returncode != 0:
+        raise RuntimeError(f"adb tcpip failed: {r.stderr.strip() or r.stdout.strip()}")
+    time.sleep(2.0)   # adbd restarts in TCP mode
+    return f"{m.group(1)}:{port}"
+
+
+def adb_pair(address: str, code: str, adb: Optional[str] = None) -> str:
+    """Android 11+ wireless debugging: pair once with the code the phone shows
+    (Developer options > Wireless debugging > Pair device with pairing code)."""
+    adb = adb or adb_path()
+    r = subprocess.run([adb, "pair", address, code], capture_output=True, text=True, timeout=30)
+    if r.returncode != 0 or "Successfully paired" not in r.stdout:
+        raise RuntimeError(f"adb pair failed: {(r.stdout + r.stderr).strip()}")
+    return r.stdout.strip()
 
 
 def sdk_version(serial: str, adb: Optional[str] = None) -> Tuple[Optional[int], str]:
@@ -88,15 +145,31 @@ def parse_android_spec(spec: str) -> Dict:
     u = urlparse(spec)
     q = {k: v[-1] for k, v in parse_qs(u.query).items()}
     return {"serial": u.netloc or None, "camera": q.get("camera", "back"),
-            "max_size": int(q.get("max_size", 1920)), "fps": int(q.get("fps", 30))}
+            "max_size": int(q.get("max_size", 1920)), "fps": int(q.get("fps", 30)),
+            "bitrate": q.get("bitrate")}
 
 
-def server_args(version: str, scid: str, camera: str, max_size: int, fps: int) -> list:
+def _bit_rate(value: Optional[str]) -> Optional[int]:
+    """'6M' / '800K' / '6000000' -> bits per second."""
+    if not value:
+        return None
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([kKmM]?)", str(value).strip())
+    if not m:
+        raise ValueError(f"bitrate {value!r}: use e.g. 6M or 800K")
+    return int(float(m.group(1)) * {"": 1, "k": 1e3, "m": 1e6}[m.group(2).lower()])
+
+
+def server_args(version: str, scid: str, camera: str, max_size: int, fps: int,
+                bitrate: Optional[str] = None) -> list:
     """Arguments of com.genymobile.scrcpy.Server for a raw H.264 camera stream."""
-    return [version, f"scid={scid}", "log_level=warn", "tunnel_forward=true", "video=true",
+    args = [version, f"scid={scid}", "log_level=warn", "tunnel_forward=true", "video=true",
             "audio=false", "control=false", "video_source=camera", f"camera_facing={camera}",
             f"camera_fps={fps}", f"max_size={max_size}", "video_codec=h264", "raw_stream=true",
             "send_dummy_byte=false", "cleanup=true"]
+    rate = _bit_rate(bitrate)
+    if rate:
+        args.append(f"video_bit_rate={rate}")
+    return args
 
 
 class AndroidCamera:
@@ -110,12 +183,15 @@ class AndroidCamera:
             raise RuntimeError("adb not found (install android-tools or unpack scrcpy into tools/)")
         if not self.server or not self.version:
             raise RuntimeError("scrcpy-server not found (unpack the scrcpy static build into tools/)")
+        if is_network_serial(self.opts["serial"]):
+            adb_connect(self.opts["serial"], self.adb)
         ready = [d["serial"] for d in adb_devices(self.adb) if d["state"] == "device"]
         serial = self.opts["serial"] or (ready[0] if ready else None)
         if serial is None or serial not in ready:
             states = ", ".join(f"{d['serial']}={d['state']}" for d in adb_devices(self.adb)) or "none"
-            raise RuntimeError(f"no authorised adb device (seen: {states}); enable USB debugging "
-                               "on the phone and accept the prompt")
+            how = ("is the phone on the same Wi-Fi, with adb in TCP mode or wireless debugging on?"
+                   if is_network_serial(serial) else "enable USB debugging on the phone and accept the prompt")
+            raise RuntimeError(f"no authorised adb device (seen: {states}); {how}")
         self.serial = serial
         self.scid = f"{random.randrange(1 << 31):08x}"
         self.port: Optional[int] = None
@@ -129,8 +205,10 @@ class AndroidCamera:
             return "missing"
 
     def restart(self) -> str:
-        """Start a fresh camera stream after the phone dropped off USB (new socket name)."""
+        """Start a fresh camera stream after the phone dropped off USB / Wi-Fi (new socket name)."""
         self.close()
+        if is_network_serial(self.serial):
+            adb_connect(self.serial, self.adb)
         self.scid = f"{random.randrange(1 << 31):08x}"
         return self.start()
 
@@ -149,7 +227,7 @@ class AndroidCamera:
         o = self.opts
         cmd = [self.adb, "-s", self.serial, "shell", f"CLASSPATH={DEVICE_SERVER_PATH}", "app_process", "/",
                "com.genymobile.scrcpy.Server",
-               *server_args(self.version, self.scid, o["camera"], o["max_size"], o["fps"])]
+               *server_args(self.version, self.scid, o["camera"], o["max_size"], o["fps"], o["bitrate"])]
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         # The server listens once it has opened the camera; wait until the socket accepts
         end = time.time() + wait

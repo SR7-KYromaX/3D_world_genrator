@@ -486,6 +486,11 @@ class Config:
     stream_depth: bool = True   # --no-stream-depth turns it off
     stream_depth_model: str = "depth-anything/Depth-Anything-V2-Small-hf"
     stream_depth_per_sync: int = 3
+    # Continuous depth (like stream_ace_tick_every for ACE mapping): one backlog keyframe every
+    # stream_depth_every trainer steps (~20 ms network each), its seeds buffered for the next
+    # sync, instead of a burst of stream_depth_per_sync keyframes stalling one sync step.
+    # Skipped while the backlog is empty or online Difix holds the GPU. 0 = the burst
+    stream_depth_every: int = 10
     stream_depth_seed_stride: int = 8
     # Dense seeding stops at this fraction of an MCMC cap (depth then only feeds the loss):
     # at the cap every seed would evict a live Gaussian, and MCMC fills the rest where the
@@ -574,6 +579,10 @@ class Config:
     difix_seed: Optional[int] = 0
     difix_deterministic: bool = True
     difix_pool_views: int = 8
+    # Stream runs with depth: a pseudo view starts from its source photo re-projected to the
+    # pseudo camera by the keyframe's Depth Anything map (ACE-aligned) and ACE pose; the splat
+    # render only fills what the photo never saw, and Difix cleans seams and holes
+    difix_depth_warp: bool = True
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -844,6 +853,16 @@ class Runner:
         # Tensorboard
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb", flush_secs=2)
 
+        self.difix = None
+        if cfg.difix_online:
+            from hypersplat.stream.difix_online import OnlineDifix
+            # Built before the stream so its model can load while the first ACE map is built
+            # (_start_stream); the scene profile is attached below, once the stream has set it up
+            self.difix = OnlineDifix(cfg.difix_model_id, self.device,
+                                     debug_dir=f"{cfg.result_dir}/difix_online",
+                                     seed=cfg.difix_seed, deterministic=cfg.difix_deterministic,
+                                     pool_views=cfg.difix_pool_views, depth_warp=cfg.difix_depth_warp)
+
         self.stream = None
         if cfg.stream_source:
             self._start_stream()
@@ -869,16 +888,9 @@ class Runner:
             if cfg.use_mask:
                 self.valset = MaskedDataset(self.valset, cfg.mask_dir)
         self.base_trainset = self.trainset
-        self.difix = None
-        if cfg.difix_online:
+        if self.difix is not None:
             from hypersplat.pipeline.params import SceneProfile
-            from hypersplat.stream.difix_online import OnlineDifix
-            self.difix = OnlineDifix(cfg.difix_model_id, self.device,
-                                     profile=SceneProfile.from_env() or SceneProfile(),
-                                     debug_dir=f"{cfg.result_dir}/difix_online",
-                                     seed=cfg.difix_seed, deterministic=cfg.difix_deterministic,
-                                     pool_views=cfg.difix_pool_views)
-            self.difix.preload()   # pinned host copy now; the first round only copies to the GPU
+            self.difix.profile = SceneProfile.from_env() or SceneProfile()
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -909,6 +921,10 @@ class Runner:
             init_ply_path=cfg.init_ply_path,
             max_init_pts=cfg.strategy.cap_max if isinstance(cfg.strategy, MCMCStrategy) else None,
         )
+        # A parameter created while a Hugging Face load patches torch lands on the meta device
+        # and only fails at the first CUDA kernel (an internal CUDAGuard assert): fail here
+        assert self.splats["means"].device.type == torch.device(self.device).type, (
+            f"splats initialized on {self.splats['means'].device}, expected {self.device}")
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 
         # Densification Strategy
@@ -1134,6 +1150,7 @@ class Runner:
             replay=cfg.stream_replay,
         )
         self.depth_estimator = None
+        self._depth_seeds: List[Tuple[np.ndarray, np.ndarray]] = []   # continuous depth -> next sync
         if cfg.stream_depth:
             from hypersplat.stream.depth import DepthEstimator
             self.depth_estimator = DepthEstimator(cfg.stream_depth_model, device=str(self.device)).load()
@@ -1154,9 +1171,16 @@ class Runner:
             dash = self.dashboard
             preview = DepthPreview(self.depth_estimator, self.stream.latest_frame,
                                    lambda jpg: setattr(dash, "depth_preview", jpg)).start()
+        if self.difix is not None:
+            # Load Difix into pinned host memory while the trainer only waits: the Hugging Face
+            # load patches torch process-wide, so it must finish before any module is created
+            # (and must not overlap another from_pretrained, e.g. the depth estimator above)
+            self.difix.preload()
         try:
             map_ok = self.stream.wait_for_map(should_stop=self.stream_stop_file.requested)
         finally:
+            if self.difix is not None:
+                self.difix.wait_preload()
             if preview is not None:
                 preview.stop()   # the estimator belongs to the depth worker from here on
                 self.dashboard.depth_preview = None
@@ -1215,7 +1239,7 @@ class Runner:
             self.view_adjust.slots.release_missing({kf.kid for kf in s.store.frames()})
         xyz, rgb = s.take_seeds()
         if self.depth_estimator is not None:
-            dxyz, drgb = self._stream_depth(step)
+            dxyz, drgb = self._take_depth_seeds() if cfg.stream_depth_every > 0 else self._stream_depth(step)
             cap = cfg.strategy.cap_max if isinstance(cfg.strategy, MCMCStrategy) else None
             if cap is not None and len(self.splats["means"]) >= cfg.stream_depth_seed_cap_frac * cap:
                 dxyz = dxyz[:0]
@@ -1322,16 +1346,31 @@ class Runner:
             if self.world_rank == 0 and cfg.tb_every > 0:
                 self.writer.add_scalar("stream/settle_end", h.value, step)
 
-    def _stream_depth(self, step: int) -> Tuple[np.ndarray, np.ndarray]:
-        """Dense depth for up to stream_depth_per_sync newly registered keyframes; returns
-        their seed points (normalized xyz, rgb) from the valid depth pixels."""
+    def _depth_tick(self, step: int):
+        """Continuous depth: one backlog keyframe, its seeds kept for the next sync."""
+        s = self.stream
+        if not s.depth_backlog or s.gpu_lease.holder == "difix":
+            return
+        xyz, rgb = self._stream_depth(step, n=1)
+        if len(xyz):
+            self._depth_seeds.append((xyz, rgb))
+
+    def _take_depth_seeds(self) -> Tuple[np.ndarray, np.ndarray]:
+        seeds, self._depth_seeds = self._depth_seeds, []
+        if not seeds:
+            return np.zeros((0, 3), np.float32), np.zeros((0, 3), np.float32)
+        return np.concatenate([x for x, _ in seeds]), np.concatenate([c for _, c in seeds])
+
+    def _stream_depth(self, step: int, n: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
+        """Dense depth for up to n (default stream_depth_per_sync) newly registered keyframes;
+        returns their seed points (normalized xyz, rgb) from the valid depth pixels."""
         from hypersplat.stream.depth import dense_depth, unproject
         from hypersplat.stream.source import decode_jpeg
 
         cfg = self.cfg
         s = self.stream
         pts, cols = [], []
-        for kf, pix, z in s.take_depth_jobs(cfg.stream_depth_per_sync):
+        for kf, pix, z in s.take_depth_jobs(cfg.stream_depth_per_sync if n is None else n):
             rgb = decode_jpeg(kf.jpeg.to_pybytes())
             t0 = time.time()
             disp = self.depth_estimator.predict(rgb)
@@ -1477,13 +1516,16 @@ class Runner:
             if table.num_rows < 2:
                 return None
             c2ws = np.array(table.column("c2w").to_pylist()).reshape(-1, 4, 4)
+            kids = table.column("kid").to_pylist()
+            stream = self.stream
             return DifixSources(
                 c2ws=c2ws, K=np.array(table.column("K")[0].as_py()).reshape(3, 3),
                 width=int(table.column("width")[0].as_py()), height=int(table.column("height")[0].as_py()),
                 weights=np.array(table.column("weight").to_pylist(), dtype=np.float64),
                 points=self._scene_points(),
                 get_image=lambda i: decode_jpeg(table.column("jpeg")[i].as_py()),
-                ids=table.column("kid").to_pylist(),
+                ids=kids,
+                get_depth=lambda i: stream.depth_map(kids[i]),
             )
         from hypersplat.beta.difix.augment import confidence_weights, load_ace_confidence
 
@@ -2466,6 +2508,9 @@ class Runner:
                 # Continuous ACE mapping: the sidecar runs this step's mapping work on the GPU
                 # alongside the 3DGS step (no-op in refit mode)
                 self.stream.tick()
+            if (self.stream is not None and self.depth_estimator is not None
+                    and cfg.stream_depth_every > 0 and step % cfg.stream_depth_every == 0):
+                self._depth_tick(step)   # continuous depth: one keyframe, seeds at the next sync
             if self.stream is not None and step % cfg.stream_sync_every == 0:
                 stream_stop = self._stream_sync(step)
                 if horizon.value != max_steps:
@@ -3491,16 +3536,19 @@ class Runner:
         training views these render as streaks across the screen instead of surface."""
         cfg = self.cfg
         opa = torch.sigmoid(self.splats["opacities"])
-        sc = torch.exp(self.splats["scales"])
-        smax, smin = sc.max(-1).values, sc.min(-1).values.clamp_min(1e-9)
+        sc = torch.sort(torch.exp(self.splats["scales"]), dim=-1).values   # ascending
+        smid, smax = sc[:, 1].clamp_min(1e-9), sc[:, 2]
         keep = opa >= cfg.viewer_min_opacity
+        # A needle is long in one axis only (max >> middle). max / min would also flag flat
+        # discs - the normal shape of a splat lying on a surface - and hid ~all of a model
+        aniso = smax / smid
         voxel = getattr(self, "stream_voxel", None)
         if voxel:
             big = smax > cfg.viewer_max_scale_voxels * voxel
-            needle = (smax / smin > cfg.viewer_max_aniso) & (smax > 2.0 * voxel)
+            needle = (aniso > cfg.viewer_max_aniso) & (smax > 2.0 * voxel)
             keep &= ~(big | needle)
         else:
-            keep &= smax / smin <= cfg.viewer_max_aniso
+            keep &= aniso <= cfg.viewer_max_aniso
         return keep.to(opa.dtype)
 
     def _walk_update(self, force: bool = False):

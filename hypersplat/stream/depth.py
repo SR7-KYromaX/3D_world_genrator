@@ -313,9 +313,10 @@ def depth_preview_jpeg(disp: np.ndarray, max_side: int = 640, quality: int = 80)
 
 
 class DepthPreview:
-    """Depth of the newest camera frame at ~``fps`` until stopped: something to look at while
-    the first ACE map is built. Runs the estimator on its own thread; stop() before anyone
-    else uses the estimator."""
+    """Depth of the newest keyframe at up to ~``fps`` until stopped: something to look at while
+    the first ACE map is built. Frames the session did not accept as keyframes are skipped, so
+    the network runs on keyframes only (like the training-side depth). Runs the estimator on
+    its own thread; stop() before anyone else uses the estimator."""
 
     def __init__(self, estimator: DepthEstimator, latest_frame, publish, fps: float = 3.0,
                  max_side: int = 480):
@@ -338,7 +339,7 @@ class DepthPreview:
         while not self._stop.is_set():
             t0 = time.time()
             item = self.latest_frame()
-            if item is not None and item[3] != last:
+            if item is not None and item[2] and item[3] != last:   # (image, t, keyframe, seq)
                 last = item[3]
                 try:
                     self.publish(depth_preview_jpeg(self.estimator.predict(fit_max_side(item[0], self.max_side))))
