@@ -198,3 +198,17 @@ def test_target_frac_bounds():
     for bad in (0.0, 1.0):
         with pytest.raises(ValueError):
             VJEPALatentLoss(enc, pred, FakeSecondary(), sec_dim=SEC_DIM, side=64, target_frac=bad)
+
+
+def test_gap_probe_is_zero_on_the_photo_and_repeatable():
+    from hypersplat.stream.vjepa_latent import VJEPAGapProbe
+
+    enc, pred = _tiny_models()
+    probe = VJEPAGapProbe(enc, pred, side=64, n_masks=3, seed=1)
+    torch.manual_seed(3)
+    photo = torch.rand(2, 3, 48, 64)
+    assert torch.allclose(probe.excess(photo, photo), torch.zeros(2), atol=1e-5)
+    blank = torch.full_like(photo, 0.5)                     # a render with nothing in it
+    e = probe.excess(blank, photo)                          # (random weights: only >= 0 holds)
+    assert e.shape == (2,) and (e >= 0).all() and e.sum() > 0
+    assert torch.equal(e, probe.excess(blank, photo))       # fixed masks: repeat probes compare

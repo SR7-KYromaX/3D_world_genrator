@@ -11,7 +11,7 @@ also the ceiling, so long schedules keep the original behaviour).
 """
 
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Dict, Optional, Sequence, Tuple
 
 import torch
 
@@ -143,6 +143,23 @@ class StreamHorizon:
             target = min(target, int(self.cap))
         if target <= self.value:
             return False
+        self.value = target
+        return True
+
+    def prolong(self, step: int, steps: Optional[int] = None) -> bool:
+        """The end was reached but the stream is not reconstructed yet (ReconstructionReview):
+        like new views, the end moves to ``step + steps`` (None: ``extend``; the expected
+        extension of VisualExtendEstimator otherwise). True if the end moved."""
+        if steps is None:
+            return self.on_new_views(step)
+        if self.finished:
+            return False
+        target = step + max(int(steps), 1)
+        if self.cap is not None:
+            target = min(target, int(self.cap))
+        if target <= self.value:
+            return False
+        self.anchor = None
         self.value = target
         return True
 
@@ -311,6 +328,107 @@ class WorldConvergence:
                        "waiting: " + ", ".join(waiting) + f"; {q_txt}"),
         }
         return converged
+
+
+class ReconstructionReview:
+    """End-of-horizon check for stream runs: is the whole stream reconstructed?
+
+    The horizon only moves when new views register, so a run whose mapping slowed down
+    reached its end with keyframes still unregistered and a model still improving. When
+    training reaches the end, ``decide`` compares the stream against the last review:
+
+      done       every keyframe is registered (none pending) and held-out PSNR reached
+                 ``target_psnr`` or gained < ``min_gain`` dB since the last review
+                 (no held-out views: registration alone decides)
+      progress   more views registered, a newer ACE map, or PSNR gained >= ``min_gain`` dB:
+                 extend and look again at the new end
+      stalled    no progress: up to ``max_idle`` grace extensions (the mapper may still
+                 catch up), then end and report what is missing
+    """
+
+    def __init__(self, target_psnr: float = 22.0, min_gain: float = 0.15, max_idle: int = 2):
+        self.target_psnr = target_psnr
+        self.min_gain = min_gain
+        self.max_idle = max_idle
+        self.last: Optional[dict] = None
+        self.idle = 0
+
+    def decide(self, *, keyframes: int, registered: int, pending: int, map_version: int,
+               psnr: Optional[float]) -> Tuple[bool, str]:
+        """Record a review; (extend, reason)."""
+        last = self.last or {"registered": 0, "map_version": -1, "psnr": None}
+        self.last = {"registered": registered, "map_version": map_version, "psnr": psnr}
+        missing = max(keyframes - registered, 0)
+        gain = None if psnr is None or last["psnr"] is None else psnr - last["psnr"]
+        q_txt = "no held-out views" if psnr is None else (
+            f"PSNR {psnr:.2f} dB" + ("" if gain is None else f" ({gain:+.2f} since last review)"))
+        improving = psnr is not None and (gain is None or gain >= self.min_gain)
+        if missing == 0 and pending == 0 and (
+                psnr is None or psnr >= self.target_psnr or not improving):
+            return False, f"reconstructed: all {keyframes} keyframes registered, {q_txt}"
+        mapped = registered > last["registered"] or map_version > last["map_version"]
+        todo = (f"{missing} of {keyframes} keyframes unregistered" if missing or pending
+                else "quality still improving")
+        if mapped or improving:
+            self.idle = 0
+            return True, f"{todo}, {q_txt}"
+        self.idle += 1
+        if self.idle <= self.max_idle:
+            return True, f"{todo}, no progress (grace {self.idle}/{self.max_idle}), {q_txt}"
+        return False, (f"stalled: {todo}, no new views or map for {self.max_idle} extensions, "
+                       f"{q_txt}")
+
+
+class VisualExtendEstimator:
+    """Expected extension of a stream run from the V-JEPA gap (VJEPAGapProbe), like an ETA.
+
+    ``observe`` records the excess gap of registered views by keyframe id a few times per
+    horizon. The map's learning rate is the mean per-step decline of views measured in both the
+    newest observation and the oldest kept one that shares at least ``min_common`` of them (a
+    view only compares with itself: new views would read as jumps). ``estimate`` gives the steps
+    until the worse of the registered views (``seen``) and the unregistered keyframes
+    (``unseen``, their gap from a nearby render: content the map has not learned yet, which it
+    learns at the same rate once they register) falls to ``tol``, clamped to [lo, hi]. None
+    while no rate is known or the gap does not fall: the caller keeps its fixed extension.
+    """
+
+    def __init__(self, tol: float = 0.05, lo: int = 250, hi: int = 4000, min_common: int = 2,
+                 window: int = 4):
+        self.tol = tol
+        self.lo, self.hi = int(lo), int(hi)
+        self.min_common = min_common
+        self.window = max(2, window)
+        self.obs: list = []   # (step, {kid: excess})
+
+    def observe(self, step: int, excess: Dict[int, float]):
+        if excess:
+            self.obs = (self.obs + [(int(step), dict(excess))])[-self.window:]
+
+    def rate(self) -> Optional[float]:
+        """Mean decline of the excess gap per step (positive while the map learns)."""
+        if len(self.obs) < 2:
+            return None
+        s1, e1 = self.obs[-1]
+        for s0, e0 in self.obs[:-1]:   # oldest first: the longest baseline is the least noisy
+            common = e0.keys() & e1.keys()
+            if len(common) >= self.min_common and s1 > s0:
+                return sum(e0[k] - e1[k] for k in common) / len(common) / (s1 - s0)
+        return None
+
+    def estimate(self, unseen: Optional[float] = None) -> Tuple[Optional[int], str]:
+        """(expected extension in steps or None, human summary)."""
+        if not self.obs:
+            return None, "no V-JEPA probe yet"
+        seen = sum(self.obs[-1][1].values()) / len(self.obs[-1][1])
+        worst = seen if unseen is None else max(seen, unseen)
+        txt = f"V-JEPA gap {seen:.3f}" + ("" if unseen is None else f", unregistered {unseen:.3f}")
+        r = self.rate()
+        if r is None or r <= 0:
+            return None, txt + (", no trend yet" if r is None else ", not falling")
+        if worst <= self.tol:
+            return self.lo, txt + f" <= {self.tol}: {self.lo} steps to finish"
+        steps = int(min(max((worst - self.tol) / r, self.lo), self.hi) / 50.0 + 0.5) * 50
+        return steps, txt + f" falling {r * 1000:.4f}/1k steps: ~{steps} steps to {self.tol}"
 
 
 def _robust_score(x: torch.Tensor, lo_q: float = 0.5, hi_q: float = 0.99, sample: int = 100_000) -> torch.Tensor:

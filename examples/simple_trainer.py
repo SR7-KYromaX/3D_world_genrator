@@ -47,7 +47,9 @@ from hypersplat.stream.vjepa_latent import LatentPacer
 from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
 from trainer_schedule import (
     PlateauDetector,
+    ReconstructionReview,
     StreamHorizon,
+    VisualExtendEstimator,
     WorldConvergence,
     early_stop_defaults,
     floater_prune_mask,
@@ -447,6 +449,24 @@ class Config:
     stream_extend_steps: Optional[int] = None
     # Optional hard ceiling on the dynamic length (None: uncapped)
     stream_max_steps_cap: Optional[int] = None
+    # At the end of the horizon, check the whole stream is reconstructed (every keyframe
+    # registered, held-out PSNR at stream_converge_target_psnr or flat) and extend while
+    # mapping or quality still progresses (ReconstructionReview); after this many
+    # extensions without progress the run ends and reports what is missing
+    stream_review: bool = True
+    stream_review_max_idle: int = 2
+    # Size each extension by the V-JEPA gap (VisualExtendEstimator): the frozen V-JEPA 2
+    # predictor, given a render as context, predicts the photo's held-out patches; the excess
+    # over its own error on the photo is what the map still misses. Measured on up to
+    # stream_review_jepa_views views every stream_converge_every steps (plus unregistered
+    # keyframes from the nearest registered pose at the review); the extension is the steps
+    # until it falls to stream_review_jepa_tol at the observed rate, within
+    # [extend / 4, stream_review_jepa_max_extend or 4 * extend]. Without a checkpoint or a
+    # trend yet, the fixed stream_extend_steps applies.
+    stream_review_jepa: bool = True
+    stream_review_jepa_tol: float = 0.05
+    stream_review_jepa_views: int = 8
+    stream_review_jepa_max_extend: Optional[int] = None
     # Stop recording (camera released, training continues on the keyframes collected) after
     # this many seconds / keyframes; also on <result_dir>/STOP_RECORDING or the dashboard button
     stream_record_seconds: Optional[float] = None
@@ -1225,6 +1245,18 @@ class Runner:
                   f"{cfg.stream_converge_every} steps, target {cfg.stream_converge_target_psnr} dB, "
                   f"min {cfg.stream_converge_min_steps} steps); max_steps is only a ceiling")
         self._horizon_logged = cfg.max_steps
+        self.review = (ReconstructionReview(target_psnr=cfg.stream_converge_target_psnr,
+                                            min_gain=cfg.stream_converge_min_gain,
+                                            max_idle=cfg.stream_review_max_idle)
+                       if cfg.stream_review else None)
+        self._reviewed_end = None
+        self.extend_estimator = None
+        if self.review is not None and cfg.stream_review_jepa:
+            ext = self.stream_horizon.extend
+            self.extend_estimator = VisualExtendEstimator(
+                tol=cfg.stream_review_jepa_tol, lo=max(ext // 4, 2 * cfg.stream_sync_every),
+                hi=cfg.stream_review_jepa_max_extend or 4 * ext)
+        self._gap_probe = None   # VJEPAGapProbe, built on first use; False when unavailable
         self._stream_failed_logged = False
         print(f"[Stream] Map ready: {len(self.parser.points)} seed points, scene scale "
               f"{self.parser.scene_scale:.3f}, seed voxel {self.stream_voxel:.4f}")
@@ -1297,9 +1329,157 @@ class Runner:
             print(f"\n[Stream] Source fully localized at step {step}; {cfg.stream_tail_steps} more steps")
         if cfg.stream_settle and not h.finished and not h.settled and step >= cfg.stream_settle_min_steps:
             self._maybe_settle(step)
+        if (self.extend_estimator is not None and step > 0 and step % cfg.stream_converge_every == 0
+                and s.map_ready.is_set()):
+            self._jepa_observe(step)
+        if (self.review is not None and not h.finished and self._reviewed_end != h.value
+                and step >= h.value - cfg.stream_sync_every):
+            self._review_horizon(step)   # last sync before the end
         if hasattr(cfg.strategy, "refine_stop_iter"):
             cfg.strategy.refine_stop_iter = h.refine_stop_iter
         return False
+
+    def _review_horizon(self, step: int):
+        """Training reached the end of its horizon: extend it while the stream is not fully
+        reconstructed and mapping or quality still progresses (ReconstructionReview)."""
+        h = self.stream_horizon
+        st = self.stream.stats()
+        extend, why = self.review.decide(keyframes=st["keyframes"], registered=st["registered"],
+                                         pending=st["pending"], map_version=st["map_version"] or 0,
+                                         psnr=self._probe_psnr(step))
+        steps, eta = None, None
+        if extend and self.extend_estimator is not None and self._jepa_observe(step):
+            unseen = self._jepa_unseen(step) if st["unregistered"] else None
+            steps, eta = self.extend_estimator.estimate(unseen)
+        if extend and h.prolong(step, steps):
+            print(f"\n[Review] step {step}: not reconstructed yet ({why}); training extended to "
+                  f"{h.value} steps " + (f"(expected: {eta})" if steps is not None else
+                                         f"(fixed +{h.extend}{'; ' + eta if eta else ''})"))
+            self._horizon_logged = h.value
+        else:
+            capped = extend and h.cap is not None
+            print(f"\n[Review] step {step}: ending at {h.value} - "
+                  f"{'step cap ' + str(h.cap) + ' reached; ' if capped else ''}{why}"
+                  + (f" (expected another {eta})" if capped and eta else ""))
+            if self.dashboard is not None:
+                self.dashboard.update_training(world=f"review: {why}")
+        self._reviewed_end = h.value
+        if self.world_rank == 0 and self.cfg.tb_every > 0:
+            self.writer.add_scalar("stream/review_extend", int(extend), step)
+            if steps is not None:
+                self.writer.add_scalar("stream/expected_extend", steps, step)
+
+    def _vjepa_gap_probe(self):
+        """The VJEPAGapProbe (sharing the latent loss's V-JEPA modules when loaded), or None when
+        no checkpoint is available: the review then extends by the fixed amount."""
+        if self._gap_probe is None:
+            from hypersplat.stream.vjepa_latent import VJEPAGapProbe, load_vjepa2_vitl
+
+            cfg = self.cfg
+            try:
+                vj = getattr(self, "_vjepa", None)
+                if vj is not None:
+                    enc, pred = vj.encoder, vj.predictor
+                else:
+                    missing = missing_vjepa_checkpoint(True, "vjepa", cfg.vjepa_checkpoint)
+                    if missing:
+                        raise FileNotFoundError(missing)
+                    enc, pred = load_vjepa2_vitl(cfg.vjepa_checkpoint, side=cfg.vjepa_side,
+                                                 device=str(self.device))
+                self._gap_probe = VJEPAGapProbe(enc, pred, side=cfg.vjepa_side)
+                print("[Review] V-JEPA gap probe ready: extensions follow the expected steps")
+            except Exception as e:   # no checkpoint / out of memory: fixed extensions
+                print(f"[Review] V-JEPA gap probe unavailable ({e}); fixed extensions")
+                self._gap_probe = False
+        return self._gap_probe or None
+
+    def _render_rgb(self, step: int, c2w, K, width: int, height: int) -> torch.Tensor:
+        """(1, 3, H, W) render in [0, 1] of one camera."""
+        cfg = self.cfg
+        colors, _, _ = self.rasterize_splats(
+            camtoworlds=torch.as_tensor(c2w, device=self.device).float().reshape(1, 4, 4),
+            Ks=torch.as_tensor(K, device=self.device).float().reshape(1, 3, 3), width=width,
+            height=height, sh_degree=min(step // cfg.sh_degree_interval, cfg.sh_degree),
+            near_plane=cfg.near_plane, far_plane=cfg.far_plane)
+        return colors.clamp(0.0, 1.0).permute(0, 3, 1, 2)
+
+    @staticmethod
+    def _photo(image) -> torch.Tensor:
+        return torch.as_tensor(image).float().permute(2, 0, 1)[None] / 255.0
+
+    def _gap_probe_oom(self, e: Exception):
+        print(f"[Review] V-JEPA gap probe out of GPU memory ({e}); fixed extensions from here")
+        self._gap_probe = False
+        torch.cuda.empty_cache()
+
+    def _jepa_observe(self, step: int) -> bool:
+        try:
+            return self._jepa_observe_views(step)
+        except torch.cuda.OutOfMemoryError as e:   # the GPU is shared with ACE / Difix / depth
+            self._gap_probe_oom(e)
+            return False
+
+    @torch.no_grad()
+    def _jepa_observe_views(self, step: int) -> bool:
+        """V-JEPA excess gap of up to stream_review_jepa_views registered views (held-out ones
+        when there are a few, else all real ones), fed to the extend estimator. False when the
+        probe is unavailable or there is nothing to measure."""
+        probe = self._vjepa_gap_probe()
+        if probe is None:
+            return False
+        self.valset.refresh()
+        items = [self.valset[i] for i in range(len(self.valset))]
+        if len(items) < 2:
+            from hypersplat.stream.schema import select_rows
+            from hypersplat.stream.training import _view_item
+
+            table = select_rows(self.stream.views_table(), kind="real")
+            items = [_view_item(table, i, i) for i in range(table.num_rows)]
+        if not items:
+            return False
+        k = min(len(items), max(1, self.cfg.stream_review_jepa_views))
+        excess = {}
+        for i in np.linspace(0, len(items) - 1, k).round().astype(int):
+            d = items[int(i)]
+            photo = self._photo(d["image"]).to(self.device)
+            render = self._render_rgb(step, d["camtoworld"], d["K"], photo.shape[3], photo.shape[2])
+            excess[int(d["kid"])] = float(probe.excess(render, photo)[0])
+        self.extend_estimator.observe(step, excess)
+        return True
+
+    def _jepa_unseen(self, step: int) -> Optional[float]:
+        try:
+            return self._jepa_unseen_views(step)
+        except torch.cuda.OutOfMemoryError as e:
+            self._gap_probe_oom(e)
+            return None
+
+    @torch.no_grad()
+    def _jepa_unseen_views(self, step: int) -> Optional[float]:
+        """Mean V-JEPA excess gap of up to stream_review_jepa_views unregistered keyframes,
+        each predicted from a render at the nearest registered keyframe's pose (by keyframe id,
+        i.e. capture order): the content the map has not learned yet."""
+        from hypersplat.stream.schema import select_rows
+        from hypersplat.stream.source import decode_jpeg
+
+        probe = self._vjepa_gap_probe()
+        table = select_rows(self.stream.views_table(), kind="real")
+        unreg = self.stream.store.unregistered()
+        if probe is None or table.num_rows == 0 or not unreg:
+            return None
+        kids = np.asarray(table.column("kid").to_pylist())
+        k = min(len(unreg), max(1, self.cfg.stream_review_jepa_views))
+        vals = []
+        for i in np.linspace(0, len(unreg) - 1, k).round().astype(int):
+            kf = unreg[int(i)]
+            j = int(np.abs(kids - kf.kid).argmin())
+            K = np.asarray(table.column("K")[j].as_py(), np.float32).reshape(3, 3).copy()
+            K[0] *= kf.width / table.column("width")[j].as_py()    # neighbour's camera at this size
+            K[1] *= kf.height / table.column("height")[j].as_py()
+            photo = self._photo(decode_jpeg(kf.jpeg.to_pybytes())).to(self.device)
+            render = self._render_rgb(step, table.column("c2w")[j].as_py(), K, kf.width, kf.height)
+            vals.append(float(probe.excess(render, photo)[0]))
+        return float(np.mean(vals))
 
     def _wait_stream_settled(self, timeout: float = 600.0):
         """Deterministic runs: let a file source finish localizing before step 0, so every
@@ -1454,14 +1634,8 @@ class Runner:
         vals = []
         for i in np.linspace(0, n - 1, k).round().astype(int):
             data = self.valset[int(i)]
-            pixels = torch.as_tensor(data["image"], device=self.device).float()[None].permute(0, 3, 1, 2) / 255.0
-            K = torch.as_tensor(data["K"], device=self.device).float()[None]
-            h, w = pixels.shape[2:]
-            colors, _, _ = self.rasterize_splats(
-                camtoworlds=torch.as_tensor(data["camtoworld"], device=self.device).float()[None],
-                Ks=K, width=w, height=h, sh_degree=min(step // cfg.sh_degree_interval, cfg.sh_degree),
-                near_plane=cfg.near_plane, far_plane=cfg.far_plane)
-            colors = colors.clamp(0.0, 1.0).permute(0, 3, 1, 2)
+            pixels = self._photo(data["image"]).to(self.device)
+            colors = self._render_rgb(step, data["camtoworld"], data["K"], pixels.shape[3], pixels.shape[2])
             mse = F.mse_loss(colors, pixels).clamp_min(1e-10)
             vals.append(float(-10.0 * torch.log10(mse)))
         return float(np.mean(vals))

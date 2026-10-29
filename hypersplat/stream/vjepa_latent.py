@@ -42,6 +42,24 @@ VJEPA_TUBELET = 2
 _MEAN = (0.485, 0.456, 0.406)
 _STD = (0.229, 0.224, 0.225)
 
+def vjepa_grid(side: int, h: int, w: int):
+    """V-JEPA patch grid for an (h, w) photo: long side ``side``, multiples of the patch size."""
+    s = side / max(h, w)
+    gh = max(1, int(round(h * s / VJEPA_PATCH)))
+    gw = max(1, int(round(w * s / VJEPA_PATCH)))
+    return gh, gw
+
+
+def vjepa_clip(img: torch.Tensor, gh: int, gw: int) -> torch.Tensor:
+    """(B, 3, H, W) in [0, 1] -> (B, 3, T=2, gh*16, gw*16) ImageNet-normalised clip (frame duplicated)."""
+    x = F.interpolate(img, size=(gh * VJEPA_PATCH, gw * VJEPA_PATCH), mode="bilinear",
+                      align_corners=False, antialias=True)
+    mean = torch.tensor(_MEAN, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+    std = torch.tensor(_STD, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+    x = (x - mean) / std
+    return x.unsqueeze(2).repeat(1, 1, VJEPA_TUBELET, 1, 1)
+
+
 class LatentPacer:
     """Paces the V-JEPA term against the trainer's own step rate.
 
@@ -201,20 +219,10 @@ class VJEPALatentLoss(nn.Module):
         self.sec_proj.load_state_dict(state)
 
     def _grid(self, h: int, w: int):
-        """V-JEPA patch grid for an (h, w) photo: long side ``side``, multiples of the patch size."""
-        s = self.side / max(h, w)
-        gh = max(1, int(round(h * s / VJEPA_PATCH)))
-        gw = max(1, int(round(w * s / VJEPA_PATCH)))
-        return gh, gw
+        return vjepa_grid(self.side, h, w)
 
     def _clip(self, img: torch.Tensor, gh: int, gw: int) -> torch.Tensor:
-        """(B, 3, H, W) in [0, 1] -> (B, 3, T=2, gh*16, gw*16) ImageNet-normalised clip (frame duplicated)."""
-        x = F.interpolate(img, size=(gh * VJEPA_PATCH, gw * VJEPA_PATCH), mode="bilinear",
-                          align_corners=False, antialias=True)
-        mean = torch.tensor(_MEAN, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
-        std = torch.tensor(_STD, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
-        x = (x - mean) / std
-        return x.unsqueeze(2).repeat(1, 1, VJEPA_TUBELET, 1, 1)
+        return vjepa_clip(img, gh, gw)
 
     @torch.no_grad()
     def _secondary_grid(self, photo: torch.Tensor, gh: int, gw: int) -> torch.Tensor:
@@ -280,6 +288,59 @@ class VJEPALatentLoss(nn.Module):
             alpha_hole = (rel * hole * (1.0 - a_t)).mean()
             hole_frac = hole.mean().item()
         return VJEPAOut(latent, alpha_hole, hole_frac)
+
+
+class VJEPAGapProbe:
+    """How much of a photo the map still misses, seen through the frozen V-JEPA 2 predictor.
+
+    The render's encoder tokens are the predictor's context; it predicts the latents of held-out
+    patches, compared (1 - cos) with the photo's encoder latents there. The same masks with the
+    photo itself as context give the predictor's own error on that image (its floor), so
+
+        excess = (gap(render -> photo) - gap(photo -> photo)) / gap(photo -> photo)
+
+    is 0 when the render carries everything the photo does and grows with missing or wrong
+    content. A render from a nearby registered pose measures an unregistered keyframe: what of
+    it the map has not seen. Masks are fixed (``seed``) so repeated probes of a view compare.
+    No gradients; the latent loss's SecondaryHook passes through while unset.
+    """
+
+    def __init__(self, encoder: nn.Module, predictor: nn.Module, side: int = 256,
+                 target_frac: float = 0.5, n_masks: int = 4, seed: int = 0, mask_index: int = 0):
+        self.encoder = encoder.eval()
+        self.predictor = predictor.eval()
+        self.side = side
+        self.target_frac = target_frac
+        self.n_masks = max(1, n_masks)
+        self.seed = seed
+        self.mask_index = mask_index
+
+    def _masks(self, N: int, B: int, device):
+        g = torch.Generator().manual_seed(self.seed)
+        n_tgt = min(N - 1, max(1, int(round(N * self.target_frac))))
+        for _ in range(self.n_masks):
+            order = torch.rand(N, generator=g).argsort().to(device)
+            yield order[:N - n_tgt].expand(B, -1), order[N - n_tgt:].expand(B, -1)
+
+    def _gap(self, full_ctx: torch.Tensor, full_tgt: torch.Tensor, ctx, tgt) -> torch.Tensor:
+        pred = self.predictor(apply_masks(full_ctx, [ctx]), [ctx], [tgt], mask_index=self.mask_index)
+        p = F.normalize(pred.float(), dim=-1)
+        t = F.normalize(apply_masks(full_tgt, [tgt]).float(), dim=-1)
+        return (1.0 - (p * t).sum(-1)).mean(dim=1)   # (B,)
+
+    @torch.no_grad()
+    def excess(self, render: torch.Tensor, photo: torch.Tensor) -> torch.Tensor:
+        """``render`` / ``photo``: (B, 3, H, W) in [0, 1] -> (B,) relative excess gap."""
+        B, _, H, W = photo.shape
+        gh, gw = vjepa_grid(self.side, H, W)
+        dtype = next(self.encoder.parameters()).dtype
+        full_r = self.encoder(vjepa_clip(render, gh, gw).to(dtype))
+        full_p = self.encoder(vjepa_clip(photo, gh, gw).to(dtype))
+        gap = floor = 0.0
+        for ctx, tgt in self._masks(gh * gw, B, photo.device):
+            gap = gap + self._gap(full_r, full_p, ctx, tgt)
+            floor = floor + self._gap(full_p, full_p, ctx, tgt)
+        return ((gap - floor) / floor.clamp_min(1e-6)).clamp_min(0.0)
 
 
 def load_vjepa2_vitl(checkpoint: str, side: int = 256, device: str = "cuda", half: bool = True):

@@ -13,6 +13,9 @@ if str(EXAMPLES) not in sys.path:
 
 from trainer_schedule import (  # noqa: E402
     PlateauDetector,
+    ReconstructionReview,
+    StreamHorizon,
+    VisualExtendEstimator,
     WorldConvergence,
     early_stop_defaults,
     floater_prune_mask,
@@ -302,3 +305,135 @@ def test_mcmc_schedule_growth_reaches_cap_on_short_schedules():
     long = MCMCStrategy(cap_max=300_000, refine_stop_iter=25_000, growth="schedule")
     assert long.growth_rate(100_000, 1_000) == pytest.approx(0.05)
     assert sched.growth_rate(43_782, 600) <= sched.growth_max_rate
+
+
+def test_review_extends_while_mapping_progresses_then_reports_a_stall():
+    # The live run that ended at 2000 steps with 149 of 174 keyframes unregistered
+    r = ReconstructionReview(target_psnr=22.0, min_gain=0.15, max_idle=2)
+    ext, why = r.decide(keyframes=174, registered=20, pending=5, map_version=4, psnr=21.0)
+    assert ext and "154 of 174 keyframes unregistered" in why
+    ext, _ = r.decide(keyframes=174, registered=60, pending=0, map_version=6, psnr=21.0)
+    assert ext                                    # more views registered: progress
+    for grace in (1, 2):                          # nothing moves: grace extensions...
+        ext, why = r.decide(keyframes=174, registered=60, pending=0, map_version=6, psnr=21.05)
+        assert ext and f"grace {grace}/2" in why
+    ext, why = r.decide(keyframes=174, registered=60, pending=0, map_version=6, psnr=21.05)
+    assert not ext and why.startswith("stalled: 114 of 174 keyframes unregistered")
+
+
+def test_review_extends_for_quality_and_ends_when_reconstructed():
+    r = ReconstructionReview(target_psnr=22.0, min_gain=0.15)
+    # all registered but below target and still improving: keep training
+    assert r.decide(keyframes=50, registered=50, pending=0, map_version=3, psnr=20.0)[0]
+    assert r.decide(keyframes=50, registered=50, pending=0, map_version=3, psnr=20.8)[0]
+    ext, why = r.decide(keyframes=50, registered=50, pending=0, map_version=3, psnr=20.85)
+    assert not ext and why.startswith("reconstructed: all 50 keyframes registered")   # plateau
+    # at target: done at once; no held-out views: registration alone decides
+    assert not ReconstructionReview().decide(keyframes=9, registered=9, pending=0,
+                                             map_version=1, psnr=23.7)[0]
+    assert not ReconstructionReview().decide(keyframes=9, registered=9, pending=0,
+                                             map_version=1, psnr=None)[0]
+    # registered but still pending work on the map: not done
+    assert ReconstructionReview().decide(keyframes=9, registered=9, pending=2,
+                                         map_version=1, psnr=23.7)[0]
+
+
+def test_review_progress_resets_the_grace_count():
+    r = ReconstructionReview(max_idle=1)
+    r.decide(keyframes=10, registered=2, pending=0, map_version=1, psnr=None)
+    assert r.decide(keyframes=10, registered=2, pending=0, map_version=1, psnr=None)[0]   # grace 1
+    assert r.decide(keyframes=10, registered=3, pending=0, map_version=1, psnr=None)[0]   # progress
+    assert r.decide(keyframes=10, registered=3, pending=0, map_version=1, psnr=None)[0]   # grace again
+    assert not r.decide(keyframes=10, registered=3, pending=0, map_version=1, psnr=None)[0]
+
+
+def test_stream_horizon_prolong_moves_the_end_but_respects_cap_and_finish():
+    h = StreamHorizon(2000, 1000, extend=1000)
+    assert h.prolong(1960) and h.value == 2960
+    capped = StreamHorizon(2000, 1000, extend=1000, cap=2000)
+    assert not capped.prolong(1960) and capped.value == 2000
+    done = StreamHorizon(2000, 1000, extend=1000)
+    done.finish(2100)
+    assert not done.prolong(2060) and done.value == 2100
+
+
+def test_trainer_review_extends_the_horizon_and_logs_the_stall(capsys):
+    import types
+
+    st = pytest.importorskip("simple_trainer")
+    stats = {"keyframes": 174, "registered": 20, "pending": 5, "map_version": 4}
+    me = types.SimpleNamespace(
+        stream_horizon=StreamHorizon(2000, 1000, extend=1000),
+        stream=types.SimpleNamespace(stats=lambda: dict(stats)),
+        review=ReconstructionReview(max_idle=0), extend_estimator=None, dashboard=None, world_rank=0,
+        cfg=types.SimpleNamespace(tb_every=0), _horizon_logged=2000, _reviewed_end=None,
+        _probe_psnr=lambda step: 21.0)
+    st.Runner._review_horizon(me, 1950)
+    assert me.stream_horizon.value == 2950 and me._reviewed_end == 2950
+    assert "training extended to 2950" in capsys.readouterr().out
+    st.Runner._review_horizon(me, 2900)          # nothing registered since: stall, end
+    assert me.stream_horizon.value == 2950
+    assert "stalled: 154 of 174 keyframes unregistered" in capsys.readouterr().out
+
+
+def test_visual_extend_is_the_eta_of_the_jepa_gap_on_views_seen_twice():
+    v = VisualExtendEstimator(tol=0.05, lo=250, hi=4000)
+    assert v.estimate() == (None, "no V-JEPA probe yet")
+    v.observe(500, {1: 0.45, 2: 0.35})
+    steps, why = v.estimate()
+    assert steps is None and "no trend yet" in why          # one observation: fixed extension
+    v.observe(1500, {1: 0.35, 2: 0.25, 3: 0.9})              # kid 3 is new: not in the rate
+    assert v.rate() == pytest.approx(1e-4)
+    steps, why = v.estimate()                                # mean gap 0.5 (kid 3 included)
+    assert steps == 4000 and "~4000 steps" in why            # 4500 to tol, clamped to hi
+    # unregistered content the map lacks sets the extension when it is the worse gap
+    v2 = VisualExtendEstimator(tol=0.05, lo=250, hi=4000)
+    v2.observe(0, {1: 0.20, 2: 0.20})
+    v2.observe(1000, {1: 0.15, 2: 0.15})                     # 5e-5 / step
+    assert v2.estimate()[0] == 2000                          # (0.15 - 0.05) / 5e-5
+    assert v2.estimate(unseen=0.40)[0] == 4000               # 7000 clamped to hi
+    assert v2.estimate(unseen=0.06)[0] == 2000               # seen still the worse one
+
+
+def test_visual_extend_falls_back_when_the_gap_does_not_fall_and_floors_when_done():
+    v = VisualExtendEstimator(tol=0.05, lo=250, hi=4000)
+    v.observe(0, {1: 0.2, 2: 0.2})
+    v.observe(500, {1: 0.21, 2: 0.2})
+    steps, why = v.estimate()
+    assert steps is None and "not falling" in why
+    v.observe(1000, {1: 0.03, 2: 0.04})
+    assert v.estimate()[0] == 250                            # already within tol: short finish
+    w = VisualExtendEstimator(window=2)
+    w.observe(0, {1: 0.3}); w.observe(500, {2: 0.3})       # no shared views: no rate
+    assert w.rate() is None
+
+
+def test_stream_horizon_prolong_by_expected_steps():
+    h = StreamHorizon(2000, 1000, extend=1000)
+    assert h.prolong(1950, 2600) and h.value == 4550
+    capped = StreamHorizon(2000, 1000, extend=1000, cap=3000)
+    assert capped.prolong(1950, 2600) and capped.value == 3000
+
+
+def test_trainer_review_uses_the_expected_extension(capsys):
+    import types
+
+    st = pytest.importorskip("simple_trainer")
+    est = VisualExtendEstimator(tol=0.05, lo=250, hi=4000)
+    est.observe(1000, {1: 0.25, 2: 0.25})
+
+    def observe(step):
+        est.observe(step, {1: 0.20, 2: 0.20})                # 5e-5 / step since 1000
+        return True
+
+    me = types.SimpleNamespace(
+        stream_horizon=StreamHorizon(2000, 1000, extend=1000),
+        stream=types.SimpleNamespace(stats=lambda: {"keyframes": 30, "registered": 20, "pending": 0,
+                                                    "map_version": 4, "unregistered": 10}),
+        review=ReconstructionReview(), extend_estimator=est, dashboard=None, world_rank=0,
+        cfg=types.SimpleNamespace(tb_every=0), _horizon_logged=2000, _reviewed_end=None,
+        _probe_psnr=lambda step: 21.0, _jepa_observe=observe, _jepa_unseen=lambda step: 0.30)
+    st.Runner._review_horizon(me, 1950)
+    # unregistered gap 0.30 is the worse: (0.30 - 0.05) / 5e-5 = 5000 -> clamped to 4000
+    assert me.stream_horizon.value == 1950 + 4000
+    assert "expected: V-JEPA gap 0.200, unregistered 0.300" in capsys.readouterr().out

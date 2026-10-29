@@ -39,7 +39,11 @@ Options:
   --record-keyframes K
                       stop recording after K keyframes (training continues)
   --steps N           training step ceiling (default 7000 for videos; live sources have none:
-                      they start at 2000 and grow ~1000 past each new view, like a download ETA);
+                      they start at 2000 and grow ~1000 past each new view, like a download ETA,
+                      and at the end keep going while keyframes are still unregistered or PSNR
+                      still improves, by the steps V-JEPA expects the remaining visual gap to
+                      take (fixed ~1000 without its checkpoint), ending with a stall report
+                      once neither moves);
                       training stops earlier once the world is reconstructed
   --target-psnr DB    held-out PSNR that counts as reconstructed once gains flatten (default 22)
   --no-auto-stop      train to the step ceiling instead of stopping on convergence
@@ -132,6 +136,8 @@ Options:
                       until a consumer uses it; off by default)
   --debug-offered DIR save every offered frame (ACE res) and its gate decision to DIR (offers.jsonl)
   --output DIR        output directory (default demo/output/stream_demo)
+  --trainer-arg K=V   pass a trainer config field through (repeatable), e.g.
+                      stream_review_max_idle=1 or stream_review_jepa_tol=0.08
   -h, --help          this help
 EOF
 }
@@ -213,6 +219,7 @@ while [[ $# -gt 0 ]]; do
         --adaptive-spacing) EXTRA+=(--trainer-arg "stream_adaptive_spacing=true") ;;
         --debug-offered)  EXTRA+=(--trainer-arg "stream_debug_offered_dir=$(realpath -m "$2")"); shift ;;
         --output)         OUTPUT="$2"; shift ;;
+        --trainer-arg)    EXTRA+=(--trainer-arg "$2"); shift ;;
         -h|--help)        usage; exit 0 ;;
         -*)               echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
         *)                SOURCE="$1" ;;
