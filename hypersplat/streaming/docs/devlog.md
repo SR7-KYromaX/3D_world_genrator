@@ -92,3 +92,19 @@ Kafka external 9094 (internal 29092), PostgreSQL 5433, Streamlit 8501.
 - Contract: `hypersplat/streaming/contract.py`; sender: `producer.py`.
 - Plan and rationale: `docs/architecture.md`, `docs/report.md`, `docs/checklist.md` (PR #28).
 - Approved plan: `~/.claude/plans/mighty-coalescing-dove.md` (local to the original dev machine).
+
+### Update (usage limit reached mid-build)
+PRs open into `feat/streaming`: #28 docs (U8), #29 dashboard (U6), #30 replay (U3), #31 infra/topics (U1),
+#32 models (U5), #33 health/bench (U7). **Not yet reported: U2 hooks, U4 processor** (workers may still be running;
+check `gh pr list`). Nothing is merged yet and the end-to-end replay demo has not been run.
+
+Open issues to fix after merge:
+- Pose features depend on scene scale: pose model over-flags the phone capture (precision ~0.35-0.40). Normalize
+  `step_dist` by window median, use `conf_ratio` instead of raw `confidence` (contract.py, then retrain).
+- Training model misses rising loss (0/128); live logging every 10 steps vs 100 in past TB runs changes window scale.
+- `producer.py`: kafka-python ignores `max_block_ms` while bootstrapping (sender thread blocks ~30 s on a dead broker);
+  add `bootstrap_timeout_ms` to `PRODUCER_CONFIG`.
+- Raise streamlit floor in requirements.txt to >=1.42.
+- bench_overhead's +56% on/off number is meaningless (no real streaming-on run exists yet); need a real pair of runs.
+- Compose stack never brought up (no compose CLI here); test on Windows Docker Desktop.
+- `u7.hypersplat.camera-poses` on the local Kafka holds ~10.8k bench events; delete the `u*.` topics before the demo.
